@@ -92,6 +92,106 @@ fn setup() -> RecoverySetup {
     }
 }
 
+#[test]
+fn career_recovery_profiles_follow_birthdays_and_free_agent_signing_morale() {
+    use management::career::{CareerCommand, CareerOutcome, CareerSetup, ContractAction};
+    use management::contracts::PlayerContract;
+    use std::collections::BTreeMap;
+    let mut football = game();
+    football.configure_recovery(setup()).unwrap(); // Frozen import: age 25, morale 60.
+    football
+        .configure_career(CareerSetup {
+            today: "2026-01-04".parse().unwrap(),
+            contracts: ["a-p", "b-p"]
+                .map(|id| {
+                    (
+                        id.into(),
+                        PlayerContract::new(
+                            "2000-01-05".parse().unwrap(),
+                            1000,
+                            Some(
+                                if id == "a-p" {
+                                    "2026-01-04"
+                                } else {
+                                    "2028-01-04"
+                                }
+                                .parse()
+                                .unwrap(),
+                            ),
+                            100_000,
+                            70,
+                            60,
+                        ),
+                    )
+                })
+                .into(),
+            wage_budgets: [("a".into(), 100_000), ("b".into(), 100_000)].into(),
+            reputations: [("a".into(), 50), ("b".into(), 50)].into(),
+            staff_annual_wages: BTreeMap::new(),
+        })
+        .unwrap();
+    assert_eq!(
+        football.recovery_view("b").unwrap().players["b-p"],
+        PlayerRecovery {
+            age: 25,
+            morale: 70
+        }
+    );
+    football.advance_closed_day(1, 1000, 2000).unwrap();
+    assert_eq!(
+        football.recovery_view("b").unwrap().players["b-p"],
+        PlayerRecovery {
+            age: 26,
+            morale: 70
+        }
+    );
+    assert!(football.recovery_view("a").unwrap().players.is_empty());
+    let review = football
+        .dispatch(
+            "a",
+            Request {
+                id: "sign-review".into(),
+                day: 2,
+                command: Command::Career(CareerCommand::Review {
+                    action: ContractAction::Sign {
+                        player_id: "a-p".into(),
+                        weekly_wage: 3000,
+                        years: 3,
+                    },
+                }),
+            },
+            1001,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+    let Outcome::Career(CareerOutcome::Preview(preview)) = review else {
+        panic!("Expected signing preview");
+    };
+    football
+        .dispatch(
+            "a",
+            Request {
+                id: "sign-confirm".into(),
+                day: 2,
+                command: Command::Career(CareerCommand::Confirm {
+                    preview_id: preview.id,
+                }),
+            },
+            1002,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(
+        football.recovery_view("a").unwrap().players["a-p"],
+        PlayerRecovery {
+            age: 26,
+            morale: 76
+        }
+    );
+}
+
 fn request(id: &str, command: Command) -> Request {
     Request {
         id: id.into(),

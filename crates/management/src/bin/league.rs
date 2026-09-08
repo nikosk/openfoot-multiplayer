@@ -6,6 +6,7 @@ use management::football::{Fixture, Football, RecoverySetup};
 use management::{Club, Error, Management, Manager, Player, Request};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -27,6 +28,9 @@ enum Input {
         attributes: Vec<PlayerData>,
         fixtures: Vec<Fixture>,
         recovery: Option<RecoverySetup>,
+        career: Option<management::career::CareerSetup>,
+        boards: Option<BTreeMap<String, management::football::BoardProfile>>,
+        seasons: Option<management::seasons::SeasonSetup>,
         day: u32,
         deadline_ms: u64,
         #[serde(default)]
@@ -46,6 +50,17 @@ enum Input {
         next_deadline_ms: u64,
     },
     Public {},
+    Managers {},
+    Save {},
+    SaveFile {
+        path: String,
+    },
+    LoadFile {
+        path: String,
+    },
+    Load {
+        checkpoint: Value,
+    },
     History {
         after: usize,
         limit: usize,
@@ -53,10 +68,30 @@ enum Input {
 }
 
 fn public(game: &Football) -> Value {
-    json!({"state": game.public_state(), "standings": game.standings(), "results": game.results()})
+    json!({"state": game.public_state(), "standings": game.standings(), "results": game.results(),
+        "dismissals": game.dismissals(),
+        "season_history": game.public_season_history(), "season": game.public_season_state()})
 }
 
 fn execute(game: &mut Option<Football>, input: Input) -> Result<Value, String> {
+    if let Input::LoadFile { path } = input {
+        if game.is_some() {
+            return Err("Already initialized".into());
+        }
+        let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+        let checkpoint =
+            serde_json::from_reader(io::BufReader::new(file)).map_err(|error| error.to_string())?;
+        return execute(game, Input::Load { checkpoint });
+    }
+    if let Input::Load { checkpoint } = input {
+        if game.is_some() {
+            return Err("Already initialized".into());
+        }
+        let restored = Football::load_validated(checkpoint)?;
+        let result = public(&restored);
+        *game = Some(restored);
+        return Ok(result);
+    }
     if let Input::Schedule {
         club_ids,
         first_day,
@@ -74,6 +109,9 @@ fn execute(game: &mut Option<Football>, input: Input) -> Result<Value, String> {
         attributes,
         fixtures,
         recovery,
+        career,
+        boards,
+        seasons,
         day,
         deadline_ms,
         require_match_rosters,
@@ -84,6 +122,11 @@ fn execute(game: &mut Option<Football>, input: Input) -> Result<Value, String> {
         }
         let mut management = Management::new(clubs, players, managers, day, deadline_ms)
             .map_err(|error| format!("{error:?}"))?;
+        if let Some(career) = career {
+            management
+                .configure_career(career)
+                .map_err(|error| format!("{error:?}"))?;
+        }
         if require_match_rosters {
             management
                 .require_match_rosters()
@@ -92,6 +135,12 @@ fn execute(game: &mut Option<Football>, input: Input) -> Result<Value, String> {
         let mut initialized = Football::new(management, attributes, fixtures)?;
         if let Some(recovery) = recovery {
             initialized.configure_recovery(recovery)?;
+        }
+        if let Some(boards) = boards {
+            initialized.configure_boards(boards)?;
+        }
+        if let Some(seasons) = seasons {
+            initialized.configure_seasons(seasons)?;
         }
         let result = public(&initialized);
         *game = Some(initialized);
@@ -114,6 +163,22 @@ fn execute(game: &mut Option<Football>, input: Input) -> Result<Value, String> {
                 Err(error) => return Err(format!("{error:?}")),
             };
             let window = game.window();
+            let board = match game.board_view(&actor) {
+                Ok(view) => Some(view),
+                Err(Error::Unavailable) => None,
+                Err(error) => return Err(format!("{error:?}")),
+            };
+            let career = match game.career_view(&actor) {
+                Ok(view) => Some(view),
+                Err(Error::Unavailable) => None,
+                Err(error) => return Err(format!("{error:?}")),
+            };
+            let free_agents = if career.is_some() {
+                game.free_agent_squad(&actor)
+                    .map_err(|error| format!("{error:?}"))?
+            } else {
+                vec![]
+            };
             let fixtures: Vec<_> = game
                 .fixtures()
                 .iter()
@@ -126,7 +191,7 @@ fn execute(game: &mut Option<Football>, input: Input) -> Result<Value, String> {
                 .collect();
             Ok(
                 json!({"manager_view": manager_view, "squad": squad, "lineup": lineup,
-                "match_plan": match_plan, "recovery_view": recovery_view,
+                "match_plan": match_plan, "recovery_view": recovery_view, "board": board, "career": career, "free_agents": free_agents,
                 "day": window.day, "deadline_ms": window.deadline_ms, "fixtures": fixtures}),
             )
         }
@@ -151,6 +216,24 @@ fn execute(game: &mut Option<Football>, input: Input) -> Result<Value, String> {
             )
         }
         Input::Public {} => Ok(public(game)),
+        Input::Managers {} => Ok(json!({"active_managers": game.active_managers()})),
+        Input::Save {} => game.save_state(),
+        Input::SaveFile { path } => {
+            let checkpoint = game.save_state()?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&path).map_err(|error| error.to_string())?;
+            serde_json::to_writer(&mut file, &checkpoint).map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+            Ok(json!({"saved":path,"version":1}))
+        }
+        Input::LoadFile { .. } => Err("Already initialized".into()),
+        Input::Load { .. } => Err("Already initialized".into()),
         Input::History { after, limit } => {
             let results = game.results();
             if after > results.len() {

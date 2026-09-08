@@ -68,7 +68,7 @@ fn review(game: &mut Management, seller: &str, id: &str, offer: &Offer) -> Previ
     }
 }
 
-fn balance(game: &Management, actor: &str) -> u64 {
+fn balance(game: &Management, actor: &str) -> i64 {
     game.manager_view(actor).unwrap().club.balance
 }
 
@@ -529,7 +529,7 @@ fn seller_overflow_rejects_review_without_changing_ownership_or_money() {
             Club {
                 id: "b".into(),
                 name: "Seller".into(),
-                balance: u64::MAX,
+                balance: i64::MAX,
             },
         ],
         vec![Player {
@@ -564,7 +564,7 @@ fn seller_overflow_rejects_review_without_changing_ownership_or_money() {
     assert_eq!(owner(&game, "b1"), "b");
     assert_eq!(
         (balance(&game, "a"), balance(&game, "b")),
-        (1_000, u64::MAX)
+        (1_000, i64::MAX)
     );
 }
 

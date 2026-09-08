@@ -1,10 +1,16 @@
 //! Single-owner management commands. The host supplies authenticated identity and
 //! trusted time; neither belongs in an untrusted client command payload.
+pub mod board;
 pub mod calendar;
+pub mod career;
+pub mod checkpoint;
+pub mod contracts;
+pub mod finances;
 pub mod football;
 pub mod matches;
 pub mod physical;
 pub mod recovery;
+pub mod seasons;
 pub mod selection;
 pub mod tactics;
 pub mod window;
@@ -17,7 +23,7 @@ use window::DayWindow;
 pub struct Club {
     pub id: String,
     pub name: String,
-    pub balance: u64,
+    pub balance: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +42,7 @@ pub struct Manager {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Command {
+    Career(career::CareerCommand),
     SetMatchPlan { plan: tactics::MatchPlan },
     SetRecovery { mode: recovery::RecoveryMode },
     SetLineup { player_ids: Vec<String> },
@@ -56,6 +63,7 @@ pub struct Request {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Error {
+    Contract(String),
     InvalidSetup,
     Unauthorized,
     InvalidRequest,
@@ -93,11 +101,12 @@ pub struct Offer {
 pub struct Preview {
     pub id: u64,
     pub offer: Offer,
-    pub seller_balance_after: u64,
+    pub seller_balance_after: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
+    Career(career::CareerOutcome),
     MatchPlanSet,
     RecoverySet,
     LineupSet,
@@ -135,15 +144,16 @@ pub struct ManagerView {
     pub ready: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Dependencies {
-    buyer_balance: u64,
-    seller_balance: u64,
+    buyer_balance: i64,
+    seller_balance: i64,
     buyer_revision: u64,
     seller_revision: u64,
     player_revision: u64,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
 struct StoredPreview {
     actor: String,
     day: u32,
@@ -153,6 +163,7 @@ struct StoredPreview {
 
 /// Call only from one authoritative dispatcher. No asynchronous confirmation is
 /// awaited inside this state owner. It is not itself a network authentication layer.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Management {
     clubs: BTreeMap<String, Club>,
     players: BTreeMap<String, Player>,
@@ -161,6 +172,7 @@ pub struct Management {
     player_revisions: BTreeMap<String, u64>,
     offers: BTreeMap<u64, Offer>,
     previews: BTreeMap<u64, StoredPreview>,
+    #[serde(with = "crate::checkpoint::entries")]
     receipts: BTreeMap<(String, String), (Request, Receipt)>,
     window: DayWindow,
     closed: bool,
@@ -170,6 +182,7 @@ pub struct Management {
     recovery_enabled: bool,
     match_plans: BTreeMap<String, tactics::MatchPlan>,
     minimum_squad_size: usize,
+    career: Option<career::CareerState>,
 }
 
 impl Management {
@@ -192,7 +205,7 @@ impl Management {
             || !unique(managers.iter().map(|x| x.club_id.as_str()))
             || players
                 .iter()
-                .any(|p| !clubs.iter().any(|c| c.id == p.club_id))
+                .any(|p| !p.club_id.is_empty() && !clubs.iter().any(|c| c.id == p.club_id))
             || managers
                 .iter()
                 .any(|m| !clubs.iter().any(|c| c.id == m.club_id))
@@ -216,6 +229,7 @@ impl Management {
             recovery_enabled: false,
             match_plans: BTreeMap::new(),
             minimum_squad_size: 0,
+            career: None,
         })
     }
 
@@ -305,10 +319,11 @@ impl Management {
         Ok(())
     }
 
-    /// Host-only elimination seam, not a manager tool. Football firing evaluation
-    /// and bot replacement are intentionally outside this first transaction slice.
+    /// Host-only elimination seam, not a manager tool. Authorization is removed
+    /// before receipt lookup, so previously accepted requests cannot be replayed.
     pub fn eliminate(&mut self, actor: &str) -> Result<(), Error> {
         let manager = self.managers.remove(actor).ok_or(Error::Unauthorized)?;
+        self.career_manager_eliminated(actor);
         for offer in self.offers.values_mut() {
             if offer.status == OfferStatus::Pending
                 && (offer.buyer == manager.club_id || offer.seller == manager.club_id)
@@ -375,15 +390,14 @@ impl Management {
         if player.club_id != offer.seller {
             return Err(Error::Unavailable);
         }
+        self.validate_contract_transfer(&offer.player_id, &offer.buyer)?;
         let buyer = &self.clubs[&offer.buyer];
         let seller = &self.clubs[&offer.seller];
-        if buyer.balance < offer.fee {
+        let fee = i64::try_from(offer.fee).map_err(|_| Error::Overflow)?;
+        if buyer.balance < fee {
             return Err(Error::InsufficientFunds);
         }
-        seller
-            .balance
-            .checked_add(offer.fee)
-            .ok_or(Error::Overflow)?;
+        seller.balance.checked_add(fee).ok_or(Error::Overflow)?;
         Ok(Dependencies {
             buyer_balance: buyer.balance,
             seller_balance: seller.balance,
@@ -397,7 +411,8 @@ impl Management {
         let dependencies = self.dependencies(&offer)?;
         let view = Preview {
             id: self.sequence,
-            seller_balance_after: dependencies.seller_balance + offer.fee,
+            seller_balance_after: dependencies.seller_balance
+                + i64::try_from(offer.fee).map_err(|_| Error::Overflow)?,
             offer,
         };
         self.previews.insert(
@@ -415,6 +430,12 @@ impl Management {
     fn execute(&mut self, actor: &str, command: &Command) -> Result<Outcome, Error> {
         let club = self.managers[actor].club_id.clone();
         match command {
+            Command::Career(command) => {
+                if self.window.is_ready(actor) {
+                    return Err(Error::AlreadyReady);
+                }
+                self.execute_career(actor, command).map(Outcome::Career)
+            }
             Command::SetMatchPlan { plan } => {
                 if self.window.is_ready(actor) {
                     return Err(Error::AlreadyReady);
@@ -459,11 +480,12 @@ impl Management {
                 if *fee == 0 {
                     return Err(Error::InvalidFee);
                 }
-                if self.clubs[&club].balance < *fee {
+                let signed_fee = i64::try_from(*fee).map_err(|_| Error::Overflow)?;
+                if self.clubs[&club].balance < signed_fee {
                     return Err(Error::InsufficientFunds);
                 }
                 let player = self.players.get(player_id).ok_or(Error::Unavailable)?;
-                if player.club_id == club {
+                if player.club_id == club || player.club_id.is_empty() {
                     return Err(Error::Unavailable);
                 }
                 let offer = Offer {
@@ -523,13 +545,15 @@ impl Management {
                     .player_revision
                     .checked_add(1)
                     .ok_or(Error::Overflow)?;
-                self.clubs.get_mut(&offer.buyer).unwrap().balance -= offer.fee;
-                self.clubs.get_mut(&offer.seller).unwrap().balance += offer.fee;
+                let fee = i64::try_from(offer.fee).map_err(|_| Error::Overflow)?;
+                self.clubs.get_mut(&offer.buyer).unwrap().balance -= fee;
+                self.clubs.get_mut(&offer.seller).unwrap().balance += fee;
                 self.club_revisions
                     .insert(offer.buyer.clone(), buyer_revision);
                 self.club_revisions
                     .insert(offer.seller.clone(), seller_revision);
                 self.players.get_mut(&offer.player_id).unwrap().club_id = offer.buyer;
+                self.contract_transferred(&offer.player_id);
                 self.player_revisions
                     .insert(offer.player_id.clone(), player_revision);
                 for other in self

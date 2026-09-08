@@ -73,6 +73,63 @@ fn ready(actor: &str) -> Value {
 }
 
 #[test]
+fn trusted_checkpoint_roundtrip_preserves_receipts_and_cannot_replace_a_live_game() {
+    let mut original = Host::start();
+    assert_eq!(original.send(init())["ok"], true);
+    let receipt = original.send(ready("manager-a"));
+    let saved = original.send(json!({"op":"save"}));
+    assert_eq!(saved["ok"], true);
+    let mut restored = Host::start();
+    assert_eq!(
+        restored.send(json!({"op":"load", "checkpoint":{"version":999}}))["ok"],
+        false
+    );
+    assert_eq!(
+        restored.send(json!({"op":"load", "checkpoint":saved["data"]}))["ok"],
+        true
+    );
+    assert_eq!(restored.send(ready("manager-a")), receipt);
+    assert_eq!(
+        restored.send(json!({"op":"public"})),
+        original.send(json!({"op":"public"}))
+    );
+    assert_eq!(
+        restored.send(json!({"op":"load", "checkpoint":saved["data"]}))["ok"],
+        false
+    );
+}
+
+#[test]
+fn trusted_file_checkpoint_is_exclusive_and_loads_without_a_large_stdin_payload() {
+    let path = std::env::temp_dir().join(format!(
+        "league-checkpoint-protocol-{}.json",
+        std::process::id()
+    ));
+    let mut original = Host::start();
+    assert_eq!(original.send(init())["ok"], true);
+    assert_eq!(
+        original.send(json!({"op":"save_file", "path":path}))["ok"],
+        true
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        original.send(json!({"op":"save_file", "path":path}))["ok"],
+        false
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    let mut restored = Host::start();
+    assert_eq!(
+        restored.send(json!({"op":"load_file", "path":path}))["ok"],
+        true
+    );
+    assert_eq!(
+        restored.send(json!({"op":"public"})),
+        original.send(json!({"op":"public"}))
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn malformed_input_and_failed_init_do_not_poison_the_host() {
     let mut host = Host::start();
     assert_eq!(host.raw(b"not json")["ok"], false);

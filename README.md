@@ -27,8 +27,9 @@ non-blocking previews, atomic confirmation, idempotent receipts and daily closur
 The Rust executable accepts trusted host inputs; `tools/host.mjs` supplies scoped
 local HTTP authentication. Client-selected actor IDs are not authentication.
 Explicit/generated fixtures resolve at closed daily windows, with a limited bot
-policy. Full daily football consequences, contracts and career persistence remain
-pending. Missing/departed selections now receive deterministic lineup repair,
+policy. Contract lifecycle, private board evaluation/dismissal and continuing
+single-league seasons are implemented; full daily football parity remains pending.
+Missing/departed selections now receive deterministic lineup repair,
 and played minutes carry condition/fitness effects into the next day. Fewer than
 eleven available players still prevents resolution. Explicitly configured Rest and
 Recovery now restore condition on non-match days using upstream age/morale/staff/

@@ -4,6 +4,7 @@ import { mkdtemp, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { startHost } from './host.mjs';
+import { replayJournal } from './replay.mjs';
 
 function scenario() {
   const clubs = ['a', 'b'].map(id => ({ id, name: `Club ${id}`, balance: 7654321 }));
@@ -35,6 +36,92 @@ async function fixture(t, source = scenario(), options = {}) {
   }
   return { host, auth, outDir, request };
 }
+
+function careerScenario() {
+  const source = scenario();
+  source.init.fixtures = [
+    { id: 'first', day: 1, home: 'a', away: 'b', seed: 42 },
+    { id: 'return', day: 2, home: 'b', away: 'a', seed: 43 },
+  ];
+  source.init.career = { today: '2026-08-01',
+    contracts: Object.fromEntries(source.init.players.map(player => [player.id, {
+      date_of_birth: '2000-01-01', weekly_wage: 520, end_date: '2028-06-30', market_value: 100000,
+      morale: 60, manager_trust: 50, unresolved_issue: false, recent_poor_treatment: false,
+      let_expire: false, blocked_until: null, last_attempt: null, last_agreed: null, round: 0,
+    }])), wage_budgets: { a: 50000, b: 50000 }, reputations: { a: 700, b: 700 }, staff_annual_wages: {} };
+  source.init.boards = Object.fromEntries(source.init.managers.map(manager => [manager.id,
+    { reputation: 700, initial_satisfaction: 50 }]));
+  source.init.seasons = { season: 2026, season_start_month: 8, season_start_day: 1, spacing_days: 7, seed: 1001, division_tier: 0 };
+  return source;
+}
+
+test('season completion uses archived final table and keeps private board/contracts out of spectator API', async t => {
+  const { auth, request, outDir } = await fixture(t, careerScenario());
+  const own = (await request('/observe', auth.managers['manager-a'])).body;
+  assert.equal(own.career.date, '2026-08-01');
+  assert.equal(Object.keys(own.career.contracts).length, 11);
+  assert.ok(own.board);
+  for (const day of [1, 2]) {
+    const wait = request(`/wait?after=${day}`, auth.managers['manager-a']);
+    for (const token of Object.values(auth.managers)) {
+      assert.equal((await request('/command', token, { id: `ready-${day}`, day, command: 'Ready' })).code, 200);
+    }
+    await wait;
+  }
+  const state = (await request('/public')).body;
+  assert.equal(state.status, 'completed');
+  assert.equal(state.season_history.length, 1);
+  assert.ok(state.standings.every(row => row.played === 2));
+  assert.deepEqual(state.standings, state.season_history[0].standings);
+  assert.equal(state.season.season, 2027);
+  const checkpointPath = resolve(outDir, 'final.checkpoint.json');
+  const checkpoint = await readFile(checkpointPath, 'utf8');
+  assert.equal(JSON.parse(checkpoint).version, 1);
+  assert.equal((await stat(checkpointPath)).mode & 0o777, 0o600);
+  assert.ok((await replayJournal(resolve('target/debug/league'), resolve(outDir, 'journal.jsonl'))).verified_entries > 1);
+  assert.equal(await readFile(checkpointPath, 'utf8'), checkpoint);
+  for (const secret of ['weekly_wage', 'wage_budget', 'satisfaction', 'manager_outcomes', 'reputations', 'seed', 'balance']) {
+    assert.ok(!JSON.stringify(state).includes(`"${secret}"`), `Public leak: ${secret}`);
+  }
+});
+
+test('prototype bot renews an expiring contract through reviewed commands, not privileged expiry repair', async t => {
+  const source = careerScenario();
+  source.meta.external_managers = ['manager-a'];
+  source.meta.bot_managers = ['manager-b'];
+  source.init.career.contracts['b-0'].end_date = '2026-08-20';
+  const { outDir } = await fixture(t, source);
+  const entries = (await readFile(resolve(outDir, 'journal.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  const actions = entries.filter(entry => entry.input.op === 'command' && entry.input.actor === 'manager-b');
+  assert.ok(actions.some(entry => entry.input.request.command?.Career?.Review));
+  assert.ok(actions.some(entry => entry.output.data?.result?.Ok?.Career?.Applied?.action?.Renew));
+});
+
+test('dismissal revokes old token commands and waits while a replacement bot keeps the club active', async t => {
+  const source = scenario();
+  source.init.fixtures[0].day = 5;
+  source.init.boards = { 'manager-a': { reputation: 700, initial_satisfaction: 10 },
+    'manager-b': { reputation: 700, initial_satisfaction: 50 } };
+  const { auth, request } = await fixture(t, source);
+  for (const day of [1, 2]) {
+    const wait = request(`/wait?after=${day}`, auth.managers['manager-a']);
+    for (const token of Object.values(auth.managers)) {
+      assert.equal((await request('/command', token, { id: `ready-${day}`, day, command: 'Ready' })).code, 200);
+    }
+    const result = await wait;
+    assert.equal(result.body.status, day === 2 ? 'fired' : 'running');
+  }
+  const old = (await request('/observe', auth.managers['manager-a'])).body;
+  assert.equal(old.status, 'fired');
+  assert.equal(old.manager_view, undefined);
+  assert.equal((await request('/command', auth.managers['manager-a'], { id: 'ready-1', day: 1, command: 'Ready' })).code, 403);
+  const state = (await request('/public')).body;
+  assert.equal(state.dismissals.length, 1);
+  assert.equal(state.active_managers, undefined);
+  const wait = request('/wait?after=3', auth.managers['manager-b']);
+  assert.equal((await request('/command', auth.managers['manager-b'], { id: 'ready-3', day: 3, command: 'Ready' })).code, 200);
+  assert.equal((await wait).body.observation.day, 4);
+});
 
 test('manager tokens scope commands and observations; public endpoints contain no private state', async t => {
   const { auth, request, outDir } = await fixture(t);

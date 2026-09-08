@@ -12,28 +12,52 @@ for a paid contest requires explicit acceptance of its limits.
 - All clubs use the same delegated engine. Managers can set XI, six play styles,
   nine phase dials and Rest/Recovery. Saved instructions persist across days;
   automatic match changes do not replace the saved plan.
-- Simple offers require seller preview/confirmation; no wage contract, player
-  willingness, loan, registration-window or scouting mechanics are claimed.
+- Simple paid offers require seller preview/confirmation and retain the player's
+  existing contract, subject to buyer wage-budget policy. Player consent on paid
+  transfers, loans, registration windows and scouting are not implemented.
   Scheduled leagues reject sales that leave a seller below eleven players.
 - Prototype bots rank their own players by OVR times condition, prefer broad
   4-4-2 position counts, select Recovery, reject incoming offers and mark ready.
-  They use the same authorized commands. They do not shop, negotiate contracts
+  They review expected renewal terms within 180 days of expiry and confirm only
+  legal accepted previews, respecting let-expire instructions and wage policy.
+  They use the same authorized commands. They do not shop
   or reproduce OpenFoot's complete management policy. This is a deliberate
   prototype limitation, not a parity claim or permanent bot design.
-- Double round robin uses weekly fixture days from day 7, fixed input seed and
+- Double round robin uses the imported league start date, weekly fixtures, fixed input seed and
   mirrored venues. Both agents' source club is cloned independently into explicit
   league slots; no rating calibration. The normal 20-club case has 380 fixtures,
-  ending on day 266. Default daily deadline is 120 seconds; all-ready may finish
+  with dates determined by the source calendar. Default daily deadline is 120 seconds; all-ready may finish
   a day sooner. Narration completion is never a prerequisite for advancement.
 - Ranking uses points, goal difference and goals scored. Exact ties share the
   prototype championship; ID sorting is only display order.
-- Contracts, wages/financial lifecycle, full training, scouting, injuries and
-  suspensions, board/firing, cups, promotion/relegation and season rollover are not
+- Full training, scouting, injuries and
+  suspensions, cups, promotion/relegation, retirement and youth intake are not
   implemented. The source importer rejects injured selected players instead of
   healing them. Existing match events are not promises of persistent injuries.
-- Runtime state persists throughout this season; private fsynced host inputs and
-  replies can be verified by replay. Automatic crash/resume and multi-season
-  continuation are not supported yet. A partial final journal record fails replay
+- Contract renewals and free-agent signings have executable acceptance/counter/
+  rejection rules, current-state previews and explicit confirmation. Let-expire,
+  severance and date-based expiry are consequential. Expiry does not secretly
+  renew a player to keep eleven available. Salary `weekly_wage` retains upstream's
+  annual-unit behavior; Mondays charge each player/staff wage divided by 52.
+  Signed balances preserve debt. Sponsorship and attendance income remain absent.
+  Weekly board financial pressure uses that wage-only economy's cash runway,
+  alongside debt and wage-budget thresholds, not hypothetical gate income.
+- Boards have private objectives, satisfaction and warnings. Dismissal is public,
+  permanently ends the original manager's access (including receipt replay), and
+  assigns a distinct bot. All managers receive the source external-manager match
+  satisfaction rule; this is an explicit multiplayer adaptation. Replacement is
+  immediate, not the upstream AI hiring delay.
+- Complete seasons archive their final tables/results, pay tier-based prizes,
+  update reputation/objectives and generate unique next-season fixtures. Date,
+  contracts, money, player condition, plans and dismissed outcomes persist.
+  The host defaults to one completed season; `--max-seasons` sets a longer horizon.
+  Final spectator standings are the archived finish, not the reset next table.
+- Private fsynced host inputs and
+  replies can be verified by replay. Trusted local versioned save/load preserves
+  simulator state and receipts; this is not automatic host/model crash recovery.
+  The host writes `final.checkpoint.json` privately when its configured horizon
+  completes. Write failures fail the host rather than pretending state was saved.
+  A partial final journal record fails replay
   rather than being silently ignored.
 
 ## Build and import
@@ -41,7 +65,7 @@ for a paid contest requires explicit acceptance of its limits.
 ```sh
 cargo build -p management --bin league --locked --offline
 node tools/import-world.mjs --world /path/to/manifest.json \
-  --competition eng-d1 --source-team SOURCE_ID --replace-team OTHER_SLOT_ID \
+  --competition eng-d1 --source-team SOURCE_ID --replace-team OTHER_SLOT_ID --division-tier 0 \
   --out /path/to/new-private-scenario.json
 ```
 
@@ -71,7 +95,7 @@ runtime causes are emitted on the host's private stderr.
 
 | Endpoint | Authority and content |
 | --- | --- |
-| `GET /observe` | Manager bearer: own squad, plans, offers and upcoming fixtures; no seeds |
+| `GET /observe` | Manager bearer: own squad, plans, offers, board, contracts, free agents and upcoming fixtures; no seeds |
 | `POST /command` | Manager bearer: `{id, day, command}`; identity/time are host supplied |
 | `GET /wait?after=DAY` | Manager bearer: wait for advancement/terminal status, then own observation |
 | `GET /public` | Public snapshot, complete results, standings and status |
@@ -87,6 +111,31 @@ cursors reject. Compact reports omit per-touch events and full player-stat maps;
 raw public history remains available to other consumers. Narration may lag behind
 the game. A blocked or failing narration writer cannot block or fail the game.
 Narrative text is untrusted content, not markup or executable instructions.
+
+Fired manager tokens receive `{status:"fired",terminal:true,dismissal:...}` from
+observation/wait endpoints and cannot submit commands. The host continues with a
+replacement bot; other participants and the narrator are not stopped.
+
+Contract command examples (inside the ordinary `{id,day,command}` envelope):
+
+```json
+{"Career":{"Review":{"action":{"Renew":{"player_id":"PLAYER","weekly_wage":10000,"years":3}}}}}
+{"Career":{"Confirm":{"preview_id":12}}}
+{"Career":{"LetExpire":{"player_id":"PLAYER","enabled":true}}}
+```
+
+Use `Sign` with renewal-shaped terms for a free agent or `Terminate` with only
+`player_id`. Review may return a counter/rejection instead of a committable preview.
+Changed dependencies require another explicit confirmation. All new contract
+actions must precede Ready. See [the lifecycle plan](../plans/0008-contracts-board-and-rollover.md).
+
+Trusted JSON-lines process operations `save_file {path}` and `load_file {path}`
+write/read private versioned checkpoints; saving never overwrites an existing
+file and loading is permitted only before initialization. File operations avoid
+the normal 8 MiB command-line limit for full-season report history. These are not
+HTTP endpoints or manager tools. `save`/`load {checkpoint}` also support small
+in-memory snapshots. Restoring the simulator does not restore model sessions,
+host credentials, narration or wall-clock deadlines automatically.
 
 ## Checks (no model calls)
 

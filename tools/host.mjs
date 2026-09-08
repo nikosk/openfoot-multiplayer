@@ -25,16 +25,17 @@ function compactMatch(match) {
     report: { home_goals, away_goals, goals, home_stats, away_stats, home_possession, total_minutes } };
 }
 
-export async function startHost({ bin, scenario, outDir, port = 4319, dayMs = 120000,
+export async function startHost({ bin, scenario, outDir, port = 4319, dayMs = 120000, maxSeasons = 1,
   writeBroadcast = appendBroadcast }) {
   if (typeof bin !== 'string' || !bin || typeof outDir !== 'string' || !outDir) throw new Error('--bin and --out-dir are required');
   if (!Number.isSafeInteger(dayMs) || dayMs < 1) throw new Error('Invalid day duration');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid port');
+  if (!Number.isSafeInteger(maxSeasons) || maxSeasons < 1) throw new Error('Invalid season limit');
   const source = typeof scenario === 'string' ? JSON.parse(await readFile(scenario, 'utf8')) : structuredClone(scenario);
   const { init, meta } = source;
   const external = meta.external_managers;
-  const bots = meta.bot_managers;
-  const managers = init.managers.map(manager => manager.id);
+  let bots = meta.bot_managers;
+  let managers = init.managers.map(manager => manager.id);
   if (![external, bots].every(Array.isArray) || new Set([...external, ...bots]).size !== managers.length ||
       external.length + bots.length !== managers.length || managers.some(id => ![...external, ...bots].includes(id))) {
     throw new Error('Scenario manager roles must partition the manager registry');
@@ -123,13 +124,24 @@ export async function startHost({ bin, scenario, outDir, port = 4319, dayMs = 12
     mutationChain = operation.catch(() => {});
     return operation;
   };
+  const table = () => status === 'completed' && snapshot.season_history?.length
+    ? snapshot.season_history.at(-1).standings : snapshot.standings;
+  const dismissal = actor => snapshot.dismissals?.find(item => item.manager_id === actor);
   const publicView = () => {
-    const leader = snapshot.standings[0];
-    const champions = status === 'completed' && leader ? snapshot.standings.filter(row => row.points === leader.points &&
+    const standings = table();
+    const leader = standings[0];
+    const champions = status === 'completed' && leader ? standings.filter(row => row.points === leader.points &&
       row.goals_for - row.goals_against === leader.goals_for - leader.goals_against && row.goals_for === leader.goals_for).map(row => row.club_id) : [];
-    return { ...snapshot, status, deadline_ms: deadline, last_day: lastDay, champions, ...(failure ? { error: failure } : {}) };
+    return { ...snapshot, standings, status, deadline_ms: deadline, last_day: lastDay, champions, ...(failure ? { error: failure } : {}) };
   };
-  async function refresh() { snapshot = await required({ op: 'public' }); }
+  async function refresh() {
+    snapshot = await required({ op: 'public' });
+    // Manager routing is trusted-host metadata, not a spectator roster.
+    const registry = await required({ op: 'managers' });
+    managers = registry.active_managers.map(manager => manager.id);
+    bots = managers.filter(actor => !external.includes(actor));
+    ready = new Set([...ready].filter(actor => managers.includes(actor)));
+  }
   async function command(actor, request) {
     const result = await rpc({ op: 'command', actor, request, now_ms: Date.now() });
     if (result.ok && result.data.result?.Ok === 'Ready') ready.add(actor);
@@ -148,6 +160,17 @@ export async function startHost({ bin, scenario, outDir, port = 4319, dayMs = 12
       const own = await required({ op: 'observe', actor });
       let serial = 0;
       const issue = action => command(actor, { id: `bot-${day}-${++serial}`, day, command: action });
+      // Explicit limited policy, through the same review/consent/wage rules as
+      // external managers. Never silently extend expiring contracts at rollover.
+      for (const [player, terms] of Object.entries(own.career?.renewal_terms ?? {})) {
+        const contract = own.career.contracts[player];
+        if (terms.days_remaining > 180 || contract.let_expire) continue;
+        const reviewed = await issue({ Career: { Review: { action: { Renew: {
+          player_id: player, weekly_wage: terms.expected_wage, years: terms.expected_years,
+        } } } } });
+        const preview = reviewed.data?.result?.Ok?.Career?.Preview;
+        if (preview) await issue({ Career: { Confirm: { preview_id: preview.id } } });
+      }
       const ranked = [...own.squad].sort((a, b) => b.ovr * b.condition - a.ovr * a.condition || a.id.localeCompare(b.id));
       const selected = [];
       for (const [position, count] of [['Goalkeeper', 1], ['Defender', 4], ['Midfielder', 4], ['Forward', 2]]) {
@@ -180,7 +203,10 @@ export async function startHost({ bin, scenario, outDir, port = 4319, dayMs = 12
     await required({ op: 'tick', day, now_ms: now, next_deadline_ms: deadline });
     ready = new Set();
     await refresh();
-    if (day >= lastDay) { status = 'completed'; clearInterval(timer); }
+    if (snapshot.season_history?.length >= maxSeasons || (!init.seasons && day >= lastDay)) {
+      await required({ op: 'save_file', path: resolve(outDir, 'final.checkpoint.json') });
+      status = 'completed'; clearInterval(timer);
+    }
     wake();
     if (status === 'running') await runBots();
   }
@@ -223,7 +249,7 @@ export async function startHost({ bin, scenario, outDir, port = 4319, dayMs = 12
       if (req.method === 'GET' && url.pathname === '/public') return send(res, 200, publicView());
       if (req.method === 'GET' && url.pathname === '/table') return send(res, 200, {
         status, day: snapshot.state.day, clubs: snapshot.state.clubs,
-        standings: snapshot.standings, last_results: snapshot.results.slice(-20).map(compactMatch),
+        standings: table(), dismissals: snapshot.dismissals ?? [], last_results: snapshot.results.slice(-20).map(compactMatch),
       });
       if (req.method === 'GET' && url.pathname === '/broadcast') return send(res, 200, { status, narrations });
       if (req.method === 'GET' && url.pathname === '/history') {
@@ -238,7 +264,7 @@ export async function startHost({ bin, scenario, outDir, port = 4319, dayMs = 12
           if (after > snapshot.results.length) return send(res, 400, { error: 'Cursor past end' });
           await waitFor(req, res, () => status !== 'running' || snapshot.results.length > after);
           return send(res, 200, { after, next: snapshot.results.length, total: snapshot.results.length, results: snapshot.results.slice(after).map(compactMatch),
-            clubs: snapshot.state.clubs, standings: snapshot.standings, status });
+            clubs: snapshot.state.clubs, standings: table(), dismissals: snapshot.dismissals ?? [], status });
         }
         if (req.method === 'POST' && url.pathname === '/narration') {
           const item = await body(req);
@@ -261,10 +287,14 @@ export async function startHost({ bin, scenario, outDir, port = 4319, dayMs = 12
         }
       }
       if (['/observe', '/command', '/wait'].includes(url.pathname) && !actor) return send(res, 401, { error: 'Unauthorized' });
+      if (['/observe', '/command', '/wait'].includes(url.pathname) && dismissal(actor)) {
+        return send(res, req.method === 'POST' ? 403 : 200, { status: 'fired', terminal: true, dismissal: dismissal(actor) });
+      }
       if (req.method === 'GET' && url.pathname === '/observe') return send(res, 200, await required({ op: 'observe', actor }));
       if (req.method === 'GET' && url.pathname === '/wait') {
         const after = number(url, 'after', snapshot.state.day);
         await waitFor(req, res, () => status !== 'running' || snapshot.state.day > after);
+        if (dismissal(actor)) return send(res, 200, { status: 'fired', terminal: true, dismissal: dismissal(actor) });
         const observation = status === 'failed' ? null : await required({ op: 'observe', actor });
         return send(res, 200, { status, observation });
       }
@@ -273,6 +303,7 @@ export async function startHost({ bin, scenario, outDir, port = 4319, dayMs = 12
         if (!request || Object.keys(request).sort().join(',') !== 'command,day,id') return send(res, 400, { error: 'Expected only id, day, command' });
         return await mutate(async () => {
           if (status !== 'running') return send(res, 409, { error: 'League is not running' });
+          if (dismissal(actor)) return send(res, 403, { status: 'fired', terminal: true, dismissal: dismissal(actor) });
           const result = await command(actor, request);
           if (!result.ok) return send(res, 400, { error: result.error });
           if (result.data.result?.Err) return send(res, 400, { error: result.data.result.Err, receipt: result.data });
@@ -297,8 +328,20 @@ export async function startHost({ bin, scenario, outDir, port = 4319, dayMs = 12
     await journal.close(); await broadcastFile.close();
   }
   try {
+    if (maxSeasons > 1 && !init.seasons) throw new Error('Multiple seasons require career/season configuration');
+    let firstDay = 7;
+    if (init.seasons) {
+      const start = Date.parse(`${init.career?.today}T00:00:00Z`);
+      const year = Number(init.career?.today?.slice(0, 4));
+      const { season_start_month: month, season_start_day: day } = init.seasons;
+      let kickoff = Date.UTC(year, month - 1, day);
+      if (kickoff < start) kickoff = Date.UTC(year + 1, month - 1, day);
+      if (!Number.isFinite(start) || !Number.isFinite(kickoff)) throw new Error('Invalid career calendar');
+      firstDay = 1 + (kickoff - start) / 86400000;
+    }
     if (!init.fixtures.length) init.fixtures = (await required({ op: 'schedule', club_ids: init.clubs.map(club => club.id),
-      first_day: 7, spacing_days: 7, seed: meta.benchmark_seed ?? init.recovery?.seed ?? 1001 })).fixtures;
+      first_day: firstDay, spacing_days: init.seasons?.spacing_days ?? 7,
+      seed: init.seasons?.seed ?? meta.benchmark_seed ?? init.recovery?.seed ?? 1001 })).fixtures;
     init.day = 1; init.deadline_ms = deadline; init.require_match_rosters = true;
     lastDay = Math.max(...init.fixtures.map(fixture => fixture.day));
     await required(init); await refresh(); await runBots();
@@ -315,9 +358,9 @@ export async function startHost({ bin, scenario, outDir, port = 4319, dayMs = 12
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const options = {};
   for (let i = 2; i < process.argv.length; i += 2) {
-    const key = { '--bin': 'bin', '--scenario': 'scenario', '--out-dir': 'outDir', '--port': 'port', '--day-ms': 'dayMs' }[process.argv[i]];
+    const key = { '--bin': 'bin', '--scenario': 'scenario', '--out-dir': 'outDir', '--port': 'port', '--day-ms': 'dayMs', '--max-seasons': 'maxSeasons' }[process.argv[i]];
     if (!key || process.argv[i + 1] === undefined) throw new Error('Expected --bin --scenario --out-dir [--port] [--day-ms]');
-    options[key] = ['port', 'dayMs'].includes(key) ? Number(process.argv[i + 1]) : process.argv[i + 1];
+    options[key] = ['port', 'dayMs', 'maxSeasons'].includes(key) ? Number(process.argv[i + 1]) : process.argv[i + 1];
   }
   const host = await startHost(options);
   console.log(host.url);

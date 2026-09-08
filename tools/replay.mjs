@@ -3,6 +3,7 @@
 // This checks football replay, not model/session or wall-clock scheduling replay.
 import { spawn } from 'node:child_process';
 import { createReadStream } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { isDeepStrictEqual } from 'node:util';
 import { pathToFileURL } from 'node:url';
@@ -23,12 +24,19 @@ export async function replayJournal(binary, journal) {
       const entry = JSON.parse(line);
       if (!entry.input || !entry.output) throw new Error(`Invalid journal entry ${count + 1}`);
       if (spawnError) throw spawnError;
+      const fileSave = entry.input.op === 'save_file';
+      if (fileSave && (!entry.output.ok || entry.output.data?.saved !== entry.input.path || entry.output.data?.version !== 1)) {
+        throw new Error(`Cannot replay failed or invalid file save at entry ${count + 1}`);
+      }
       const reply = replies.next();
-      await new Promise((res, rej) => child.stdin.write(JSON.stringify(entry.input) + '\n', error => error ? rej(error) : res()));
+      // Replay must never execute a journal's filesystem write, even to a new
+      // path. Compare the reconstructed snapshot with the retained file instead.
+      await new Promise((res, rej) => child.stdin.write(JSON.stringify(fileSave ? { op: 'save' } : entry.input) + '\n', error => error ? rej(error) : res()));
       let timer;
       const response = await Promise.race([reply, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Replay reply timeout')), 30000); })]).finally(() => clearTimeout(timer));
       if (response.done) throw new Error(`Game exited during replay: ${stderr}`);
-      if (!isDeepStrictEqual(JSON.parse(response.value), entry.output)) throw new Error(`Replay mismatch at entry ${count + 1}`);
+      const expected = fileSave ? { ok: true, data: JSON.parse(await readFile(entry.input.path, 'utf8')) } : entry.output;
+      if (!isDeepStrictEqual(JSON.parse(response.value), expected)) throw new Error(`Replay mismatch at entry ${count + 1}`);
       count++;
     }
     if (!count) throw new Error('Empty journal');
