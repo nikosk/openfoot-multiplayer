@@ -16,12 +16,20 @@ Run the imported engine tests with `cargo test --workspace --locked`.
 Run the model-free transaction example with
 `cargo run -p management --example transfer --locked`.
 
+Run two scripted delegated fixtures and print their results/standings with
+`cargo run -p management --example fixtures --locked`. This uses explicit synthetic
+squads for a smoke test, not the intended career world. See
+[the fixture-slice plan](plans/0003-delegated-fixture-slice.md).
+
 The management core accepts trusted host identity/time and provides private manager
 views and public projections. It demonstrates FIFO dispatch, seller consent,
 non-blocking previews, atomic confirmation, idempotent receipts and daily closure.
 It is not a network server, full transfer/contract system, save format or playable
 league yet. The host must authenticate clients; client-selected actor IDs are not
-authentication. Football progression and native bot integration remain pending.
+authentication. Explicit fixtures now resolve at closed daily windows. Full daily
+football consequences, contracts, calendar generation and native manager bots are
+still pending. Invalidated lineups currently fail day resolution rather than
+automatically selecting replacements; this must be resolved before autonomous play.
 
 ## License and attribution
 

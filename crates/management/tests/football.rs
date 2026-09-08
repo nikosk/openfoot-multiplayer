@@ -1,0 +1,430 @@
+use engine::{PlayerData, PlayerRole, Position};
+use management::football::{Fixture, Football};
+use management::{
+    Club, Command, Error, Management, Manager, OfferStatus, Outcome, Player, Request,
+};
+
+fn attributes(club: &str, i: usize) -> PlayerData {
+    PlayerData {
+        id: format!("{club}-{i}"),
+        name: format!("Player {club}-{i}"),
+        position: match i {
+            0 => Position::Goalkeeper,
+            1..=4 => Position::Defender,
+            5..=8 => Position::Midfielder,
+            _ => Position::Forward,
+        },
+        ovr: 65,
+        condition: 100,
+        fitness: 75,
+        pace: 65,
+        stamina: 65,
+        strength: 65,
+        agility: 65,
+        passing: 65,
+        shooting: 65,
+        tackling: 65,
+        dribbling: 65,
+        defending: 65,
+        positioning: 65,
+        vision: 65,
+        decisions: 65,
+        composure: 65,
+        aggression: 65,
+        teamwork: 65,
+        leadership: 65,
+        handling: 65,
+        reflexes: 65,
+        aerial: 65,
+        traits: vec![],
+        role: PlayerRole::Standard,
+    }
+}
+
+fn request(id: &str, day: u32, command: Command) -> Request {
+    Request {
+        id: id.into(),
+        day,
+        command,
+    }
+}
+
+#[test]
+fn later_fixture_failure_does_not_publish_earlier_staged_result() {
+    let ids = ["a", "b", "c", "d"];
+    let data: Vec<_> = ids
+        .iter()
+        .flat_map(|club| (0..11).map(move |i| attributes(club, i)))
+        .collect();
+    let clubs = ids
+        .iter()
+        .map(|id| Club {
+            id: (*id).into(),
+            name: (*id).into(),
+            balance: 1000,
+        })
+        .collect();
+    let managers = ids
+        .iter()
+        .map(|id| Manager {
+            id: (*id).into(),
+            club_id: (*id).into(),
+        })
+        .collect();
+    let players = data
+        .iter()
+        .map(|p| Player {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            club_id: p.id.split('-').next().unwrap().into(),
+        })
+        .collect();
+    let management = Management::new(clubs, players, managers, 1, 1000).unwrap();
+    let fixtures = [("first", "a", "b"), ("second", "c", "d")]
+        .iter()
+        .map(|(id, home, away)| Fixture {
+            id: (*id).into(),
+            day: 1,
+            home: (*home).into(),
+            away: (*away).into(),
+            seed: 1001,
+        })
+        .collect();
+    let mut game = Football::new(management, data, fixtures).unwrap();
+    for club in ["a", "b", "c"] {
+        game.dispatch(
+            club,
+            request(
+                "xi",
+                1,
+                Command::SetLineup {
+                    player_ids: (0..11).map(|i| format!("{club}-{i}")).collect(),
+                },
+            ),
+            10,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+    }
+    let before = game.standings();
+    assert!(game.advance_closed_day(1, 1000, 2000).is_err());
+    assert!(game.results().is_empty());
+    assert_eq!(game.standings(), before);
+    assert_eq!(game.public_state().day, 1);
+}
+
+fn management() -> (Management, Vec<PlayerData>) {
+    let attributes: Vec<_> = ["a", "b"]
+        .into_iter()
+        .flat_map(|club| (0..11).map(move |i| attributes(club, i)))
+        .collect();
+    let clubs = ["a", "b"]
+        .map(|id| Club {
+            id: id.into(),
+            name: id.into(),
+            balance: 1000,
+        })
+        .to_vec();
+    let managers = ["a", "b"]
+        .map(|id| Manager {
+            id: id.into(),
+            club_id: id.into(),
+        })
+        .to_vec();
+    let players = attributes
+        .iter()
+        .map(|p| Player {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            club_id: p.id.split('-').next().unwrap().into(),
+        })
+        .collect();
+    (
+        Management::new(clubs, players, managers, 1, 1000).unwrap(),
+        attributes,
+    )
+}
+
+fn setup() -> Football {
+    let (management, attributes) = management();
+    let fixtures = [(1, "a", "b"), (2, "b", "a")]
+        .map(|(day, home, away)| Fixture {
+            id: format!("fixture-{day}"),
+            day,
+            home: home.into(),
+            away: away.into(),
+            seed: 1000 + u64::from(day),
+        })
+        .to_vec();
+    let mut football = Football::new(management, attributes, fixtures).unwrap();
+    for club in ["a", "b"] {
+        let result = football
+            .dispatch(
+                club,
+                request(
+                    "lineup",
+                    1,
+                    Command::SetLineup {
+                        player_ids: (0..11).map(|i| format!("{club}-{i}")).collect(),
+                    },
+                ),
+                10,
+            )
+            .unwrap()
+            .result;
+        assert_eq!(result, Ok(Outcome::LineupSet));
+    }
+    football
+}
+
+#[test]
+fn two_deadline_matchdays_have_reproducible_reports_and_consistent_standings() {
+    let mut first = setup();
+    let mut second = setup();
+    for game in [&mut first, &mut second] {
+        assert!(game.advance_closed_day(1, 999, 2000).is_err());
+        assert_eq!(game.public_state().day, 1);
+        assert!(game.results().is_empty());
+        // Neither manager is ready: the deadline must still advance football.
+        assert!(!game.manager_view("a").unwrap().ready);
+        assert!(!game.manager_view("b").unwrap().ready);
+        assert_eq!(game.advance_closed_day(1, 1000, 2000).unwrap().len(), 1);
+        assert_eq!(game.public_state().day, 2);
+        assert!(game.advance_closed_day(1, 1001, 2000).is_err());
+        assert_eq!(game.results().len(), 1);
+        assert_eq!(game.advance_closed_day(2, 2000, 3000).unwrap().len(), 1);
+        assert_eq!(game.public_state().day, 3);
+        let rows = game.standings();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.played, 2);
+            assert_eq!(row.played, row.won + row.drawn + row.lost);
+            assert_eq!(row.points, 3 * row.won + row.drawn);
+            let mut gf = 0;
+            let mut ga = 0;
+            for result in game.results() {
+                let (scored, conceded) = if result.home == row.club_id {
+                    (result.report.home_goals, result.report.away_goals)
+                } else {
+                    (result.report.away_goals, result.report.home_goals)
+                };
+                gf += u32::from(scored);
+                ga += u32::from(conceded);
+            }
+            assert_eq!((row.goals_for, row.goals_against), (gf, ga));
+        }
+        assert_eq!(rows[0].goals_for, rows[1].goals_against);
+        assert_eq!(rows[0].won, rows[1].lost);
+    }
+    assert_eq!(
+        serde_json::to_value(first.results()).unwrap(),
+        serde_json::to_value(second.results()).unwrap()
+    );
+    assert_eq!(first.standings(), second.standings());
+}
+
+#[test]
+fn private_squad_reads_and_lineup_writes_are_scoped() {
+    let selected = setup();
+    assert_eq!(selected.lineup("outsider"), Err(Error::Unauthorized));
+    assert_eq!(
+        selected.lineup("a").unwrap(),
+        (0..11).map(|i| format!("a-{i}")).collect::<Vec<_>>()
+    );
+    let mut game = setup();
+    assert!(matches!(game.squad("outsider"), Err(Error::Unauthorized)));
+    assert!(
+        game.squad("a")
+            .unwrap()
+            .iter()
+            .all(|p| p.id.starts_with("a-"))
+    );
+    let result = game
+        .dispatch(
+            "a",
+            request(
+                "opponent-xi",
+                1,
+                Command::SetLineup {
+                    player_ids: (0..11).map(|i| format!("b-{i}")).collect(),
+                },
+            ),
+            20,
+        )
+        .unwrap()
+        .result;
+    assert!(result.is_err());
+    assert_eq!(
+        game.dispatch("a", request("ready", 1, Command::Ready), 30)
+            .unwrap()
+            .result,
+        Ok(Outcome::Ready)
+    );
+    assert_eq!(
+        game.dispatch(
+            "a",
+            request(
+                "late-xi",
+                1,
+                Command::SetLineup {
+                    player_ids: (0..11).map(|i| format!("a-{i}")).collect(),
+                }
+            ),
+            40
+        )
+        .unwrap()
+        .result,
+        Err(Error::AlreadyReady)
+    );
+}
+
+#[test]
+fn transferred_player_changes_squads_and_invalidates_old_lineup_without_advancing() {
+    let mut game = setup();
+    let offer = match game
+        .dispatch(
+            "a",
+            request(
+                "bid",
+                1,
+                Command::Offer {
+                    player_id: "b-10".into(),
+                    fee: 100,
+                },
+            ),
+            20,
+        )
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        Outcome::Offered(offer) => offer,
+        other => panic!("{other:?}"),
+    };
+    let preview = match game
+        .dispatch(
+            "b",
+            request("review", 1, Command::Review { offer_id: offer.id }),
+            30,
+        )
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        Outcome::Preview(preview) => preview,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        game.dispatch(
+            "b",
+            request(
+                "confirm",
+                1,
+                Command::Confirm {
+                    preview_id: preview.id
+                }
+            ),
+            40
+        )
+        .unwrap()
+        .result,
+        Ok(Outcome::Transferred { offer_id: offer.id })
+    );
+    assert_eq!(game.squad("a").unwrap().len(), 12);
+    assert_eq!(game.squad("b").unwrap().len(), 10);
+    assert!(game.squad("a").unwrap().iter().any(|p| p.id == "b-10"));
+    assert!(
+        game.advance_closed_day(1, 1000, 2000)
+            .unwrap_err()
+            .contains("Starting XI")
+    );
+    assert_eq!(game.public_state().day, 1);
+    assert!(game.results().is_empty());
+    assert!(
+        game.standings()
+            .iter()
+            .all(|row| row.played == 0 && row.points == 0)
+    );
+}
+
+#[test]
+fn next_day_preserves_offers_but_clears_previews_and_readiness() {
+    let (mut game, _) = management();
+    let offer = match game
+        .dispatch(
+            "a",
+            request(
+                "bid",
+                1,
+                Command::Offer {
+                    player_id: "b-10".into(),
+                    fee: 100,
+                },
+            ),
+            20,
+        )
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        Outcome::Offered(offer) => offer,
+        other => panic!("{other:?}"),
+    };
+    let preview = match game
+        .dispatch(
+            "b",
+            request("review", 1, Command::Review { offer_id: offer.id }),
+            30,
+        )
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        Outcome::Preview(preview) => preview,
+        other => panic!("{other:?}"),
+    };
+    for actor in ["a", "b"] {
+        assert_eq!(
+            game.dispatch(actor, request("ready", 1, Command::Ready), 40)
+                .unwrap()
+                .result,
+            Ok(Outcome::Ready)
+        );
+    }
+    game.next_day(1, 50, 2000).unwrap();
+    for actor in ["a", "b"] {
+        let view = game.manager_view(actor).unwrap();
+        assert!(!view.ready);
+        assert_eq!(view.offers[0].status, OfferStatus::Pending);
+    }
+    assert!(!game.closed(51));
+    assert_eq!(
+        game.dispatch(
+            "b",
+            request(
+                "old-preview",
+                2,
+                Command::Confirm {
+                    preview_id: preview.id
+                }
+            ),
+            60
+        )
+        .unwrap()
+        .result,
+        Err(Error::Unavailable)
+    );
+    assert!(matches!(
+        game.dispatch(
+            "b",
+            request("fresh-review", 2, Command::Review { offer_id: offer.id }),
+            70
+        )
+        .unwrap()
+        .result,
+        Ok(Outcome::Preview(_))
+    ));
+    assert_eq!(game.next_day(1, 80, 2000), Err(Error::WrongDay));
+    assert_eq!(game.public_state().day, 2);
+}

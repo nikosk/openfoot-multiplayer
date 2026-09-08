@@ -1,5 +1,7 @@
 //! Single-owner management commands. The host supplies authenticated identity and
 //! trusted time; neither belongs in an untrusted client command payload.
+pub mod football;
+pub mod matches;
 pub mod window;
 
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,7 @@ pub struct Manager {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
+    SetLineup { player_ids: Vec<String> },
     Offer { player_id: String, fee: u64 },
     Review { offer_id: u64 },
     Confirm { preview_id: u64 },
@@ -85,6 +88,7 @@ pub struct Preview {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
+    LineupSet,
     Offered(Offer),
     Preview(Preview),
     RefreshRequired(Preview),
@@ -149,6 +153,7 @@ pub struct Management {
     window: DayWindow,
     closed: bool,
     sequence: u64,
+    lineups: BTreeMap<String, Vec<String>>,
 }
 
 impl Management {
@@ -190,6 +195,7 @@ impl Management {
             window: DayWindow::new(day, deadline_ms),
             closed: false,
             sequence: 0,
+            lineups: BTreeMap::new(),
         })
     }
 
@@ -228,6 +234,38 @@ impl Management {
             .closure(now_ms, self.managers.keys().map(String::as_str))
             .is_some();
         self.closed
+    }
+
+    pub fn lineup(&self, actor: &str) -> Result<Vec<String>, Error> {
+        let manager = self.managers.get(actor).ok_or(Error::Unauthorized)?;
+        Ok(self
+            .lineups
+            .get(&manager.club_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Host-only calendar seam. Expected day prevents duplicate advancement.
+    pub fn next_day(
+        &mut self,
+        expected_day: u32,
+        now_ms: u64,
+        next_deadline_ms: u64,
+    ) -> Result<(), Error> {
+        if expected_day != self.window.day {
+            return Err(Error::WrongDay);
+        }
+        if next_deadline_ms <= now_ms {
+            return Err(Error::InvalidRequest);
+        }
+        let next = expected_day.checked_add(1).ok_or(Error::Overflow)?;
+        if !self.closed(now_ms) {
+            return Err(Error::InvalidRequest);
+        }
+        self.window = DayWindow::new(next, next_deadline_ms);
+        self.closed = false;
+        self.previews.clear();
+        Ok(())
     }
 
     /// Host-only elimination seam, not a manager tool. Football firing evaluation
@@ -340,6 +378,22 @@ impl Management {
     fn execute(&mut self, actor: &str, command: &Command) -> Result<Outcome, Error> {
         let club = self.managers[actor].club_id.clone();
         match command {
+            Command::SetLineup { player_ids } => {
+                if self.window.is_ready(actor) {
+                    return Err(Error::AlreadyReady);
+                }
+                let ids: std::collections::BTreeSet<_> = player_ids.iter().collect();
+                if ids.len() != 11
+                    || player_ids.len() != 11
+                    || player_ids
+                        .iter()
+                        .any(|id| self.players.get(id).is_none_or(|p| p.club_id != club))
+                {
+                    return Err(Error::Unavailable);
+                }
+                self.lineups.insert(club, player_ids.clone());
+                Ok(Outcome::LineupSet)
+            }
             Command::Ready => {
                 self.window.mark_ready(actor);
                 Ok(Outcome::Ready)
