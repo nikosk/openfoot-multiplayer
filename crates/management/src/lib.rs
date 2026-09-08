@@ -1,5 +1,6 @@
 //! Single-owner management commands. The host supplies authenticated identity and
 //! trusted time; neither belongs in an untrusted client command payload.
+pub mod calendar;
 pub mod football;
 pub mod matches;
 pub mod physical;
@@ -33,6 +34,7 @@ pub struct Manager {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Command {
     SetMatchPlan { plan: tactics::MatchPlan },
     SetRecovery { mode: recovery::RecoveryMode },
@@ -45,6 +47,7 @@ pub enum Command {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Request {
     pub id: String,
     pub day: u32,
@@ -64,6 +67,7 @@ pub enum Error {
     InsufficientFunds,
     InvalidFee,
     Overflow,
+    SquadTooSmall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +169,7 @@ pub struct Management {
     recovery_modes: BTreeMap<String, recovery::RecoveryMode>,
     recovery_enabled: bool,
     match_plans: BTreeMap<String, tactics::MatchPlan>,
+    minimum_squad_size: usize,
 }
 
 impl Management {
@@ -210,7 +215,25 @@ impl Management {
             recovery_modes: BTreeMap::new(),
             recovery_enabled: false,
             match_plans: BTreeMap::new(),
+            minimum_squad_size: 0,
         })
+    }
+
+    /// Setup-only registration safety for scheduled leagues. A transfer cannot
+    /// leave the seller below the engine's eleven-player match requirement.
+    pub fn require_match_rosters(&mut self) -> Result<(), Error> {
+        if self.sequence != 0 {
+            return Err(Error::InvalidRequest);
+        }
+        if self
+            .clubs
+            .keys()
+            .any(|club| self.players.values().filter(|p| &p.club_id == club).count() < 11)
+        {
+            return Err(Error::SquadTooSmall);
+        }
+        self.minimum_squad_size = 11;
+        Ok(())
     }
 
     pub fn public_state(&self) -> PublicState {
@@ -470,6 +493,16 @@ impl Management {
                     .filter(|p| p.actor == actor && p.day == self.window.day)
                     .ok_or(Error::Unavailable)?;
                 let offer = self.seller_offer(actor, stored.view.offer.id)?;
+                if self.minimum_squad_size > 0
+                    && self
+                        .players
+                        .values()
+                        .filter(|p| p.club_id == offer.seller)
+                        .count()
+                        <= self.minimum_squad_size
+                {
+                    return Err(Error::SquadTooSmall);
+                }
                 let dependencies = self.dependencies(&offer)?;
                 if dependencies != stored.dependencies || offer != stored.view.offer {
                     let updated = self.preview(actor, offer)?;

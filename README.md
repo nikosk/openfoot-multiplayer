@@ -2,8 +2,8 @@
 
 A standalone, headless multiplayer football-management simulator in Rust.
 
-Status: foundation stage, not yet a playable multiplayer game. Includes OpenFoot's
-match engine and a separate management transaction core. See
+Status: a limited playable prototype with a local host/API, not full OpenFoot
+gameplay parity. Includes OpenFoot's match engine and a separate management core. See
 [the foundation plan](plans/0001-foundation.md) and
 [the transaction slice](plans/0002-management-transactions.md).
 
@@ -24,11 +24,11 @@ squads for a smoke test, not the intended career world. See
 The management core accepts trusted host identity/time and provides private manager
 views and public projections. It demonstrates FIFO dispatch, seller consent,
 non-blocking previews, atomic confirmation, idempotent receipts and daily closure.
-It is not a network server, full transfer/contract system, save format or playable
-league yet. The host must authenticate clients; client-selected actor IDs are not
-authentication. Explicit fixtures now resolve at closed daily windows. Full daily
-football consequences, contracts, calendar generation and native manager bots are
-still pending. Missing/departed selections now receive deterministic lineup repair,
+The Rust executable accepts trusted host inputs; `tools/host.mjs` supplies scoped
+local HTTP authentication. Client-selected actor IDs are not authentication.
+Explicit/generated fixtures resolve at closed daily windows, with a limited bot
+policy. Full daily football consequences, contracts and career persistence remain
+pending. Missing/departed selections now receive deterministic lineup repair,
 and played minutes carry condition/fitness effects into the next day. Fewer than
 eleven available players still prevents resolution. Explicitly configured Rest and
 Recovery now restore condition on non-match days using upstream age/morale/staff/
@@ -42,6 +42,13 @@ automatic in-match adjustments do not overwrite the saved plan. The example
 uses Possession versus Counter. Formation remains 4-4-2; formation-slot mapping,
 player-role commands and set pieces are not yet implemented. See
 [the tactical slice](plans/0006-persistent-match-tactics.md).
+
+## Local league and spectator prototype
+
+See [the prototype contract and commands](docs/prototype.md). The game host has no
+model-provider dependency. Public endpoints drive arbitrary viewers; the included
+terminal consumer displays standings and retrospective narration. External clients
+must provide model sessions and narrator text. No paid run is part of the tests.
 
 ## License and attribution
 

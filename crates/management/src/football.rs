@@ -42,6 +42,7 @@ pub struct Standing {
 }
 
 /// Explicit scenario inputs, not a client-editable physiology/finances backdoor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoverySetup {
     pub seed: u64,
     pub players: BTreeMap<String, crate::recovery::PlayerRecovery>,
@@ -223,6 +224,11 @@ impl Football {
         self.management.public_state()
     }
 
+    /// Host metadata; clients should expose only day/deadline, not the ready set.
+    pub fn window(&self) -> crate::window::DayWindow {
+        self.management.window.clone()
+    }
+
     /// Saved pre-match instructions, private to the authenticated club manager.
     /// Automatic in-match adjustments never write back to this plan.
     pub fn match_plan(&self, actor: &str) -> Result<crate::tactics::MatchPlan, Error> {
@@ -236,6 +242,9 @@ impl Football {
     }
     pub fn results(&self) -> &[FinishedFixture] {
         &self.results
+    }
+    pub fn fixtures(&self) -> &[Fixture] {
+        &self.fixtures
     }
     pub fn standings(&self) -> Vec<Standing> {
         let mut rows: Vec<_> = self.standings.values().cloned().collect();

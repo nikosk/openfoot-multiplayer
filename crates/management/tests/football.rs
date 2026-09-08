@@ -124,6 +124,70 @@ fn management() -> (Management, Vec<PlayerData>) {
 }
 
 #[test]
+fn playable_league_roster_floor_rejects_a_sale_without_partial_mutation() {
+    let (mut core, data) = management_with_size(11);
+    core.require_match_rosters().unwrap();
+    let mut game = Football::new(core, data, vec![]).unwrap();
+    let Outcome::Offered(offer) = game
+        .dispatch(
+            "a",
+            request(
+                "bid",
+                1,
+                Command::Offer {
+                    player_id: "b-10".into(),
+                    fee: 100,
+                },
+            ),
+            10,
+        )
+        .unwrap()
+        .result
+        .unwrap()
+    else {
+        panic!("offer")
+    };
+    let Outcome::Preview(preview) = game
+        .dispatch(
+            "b",
+            request("preview", 1, Command::Review { offer_id: offer.id }),
+            20,
+        )
+        .unwrap()
+        .result
+        .unwrap()
+    else {
+        panic!("preview")
+    };
+    assert_eq!(
+        game.dispatch(
+            "b",
+            request(
+                "accept",
+                1,
+                Command::Confirm {
+                    preview_id: preview.id,
+                }
+            ),
+            30
+        )
+        .unwrap()
+        .result,
+        Err(Error::SquadTooSmall)
+    );
+    for club in ["a", "b"] {
+        assert_eq!(game.manager_view(club).unwrap().club.balance, 1000);
+        assert_eq!(game.squad(club).unwrap().len(), 11);
+        assert_eq!(
+            game.manager_view(club).unwrap().offers[0].status,
+            OfferStatus::Pending
+        );
+    }
+    let (mut too_small, _) = management_with_size(10);
+    assert_eq!(too_small.require_match_rosters(), Err(Error::SquadTooSmall));
+}
+
+#[test]
 fn configured_recovery_does_not_add_a_matchday_boost() {
     use management::football::RecoverySetup;
     use management::recovery::{ClubRecovery, PlayerRecovery};

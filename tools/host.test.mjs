@@ -1,0 +1,142 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
+import { startHost } from './host.mjs';
+
+function scenario() {
+  const clubs = ['a', 'b'].map(id => ({ id, name: `Club ${id}`, balance: 7654321 }));
+  const managers = clubs.map(club => ({ id: `manager-${club.id}`, club_id: club.id }));
+  const attributes = clubs.flatMap(club => Array.from({ length: 11 }, (_, i) => ({
+    ...Object.fromEntries(['ovr', 'fitness', 'pace', 'stamina', 'strength', 'agility', 'passing', 'shooting',
+      'tackling', 'dribbling', 'defending', 'positioning', 'vision', 'decisions', 'composure', 'aggression',
+      'teamwork', 'leadership', 'handling', 'reflexes', 'aerial'].map(key => [key, 65])),
+    id: `${club.id}-${i}`, name: `Player ${club.id}-${i}`, condition: 100,
+    position: i === 0 ? 'Goalkeeper' : i < 5 ? 'Defender' : i < 9 ? 'Midfielder' : 'Forward',
+    traits: [], role: 'Standard',
+  })));
+  const players = attributes.map(player => ({ id: player.id, name: player.name, club_id: player.id[0] }));
+  return { init: { op: 'init', clubs, managers, attributes, players, recovery: null, day: 1, deadline_ms: 1000,
+    fixtures: [{ id: 'final', day: 1, home: 'a', away: 'b', seed: 42 }] },
+    meta: { external_managers: managers.map(manager => manager.id), bot_managers: [] } };
+}
+
+async function fixture(t, source = scenario(), options = {}) {
+  const temp = await mkdtemp(resolve(tmpdir(), 'league-host-test-'));
+  const outDir = resolve(temp, 'run');
+  const host = await startHost({ bin: resolve('target/debug/league'), scenario: source, outDir, port: 0, dayMs: 60000, ...options });
+  t.after(host.close);
+  const auth = JSON.parse(await readFile(resolve(outDir, 'auth.json'), 'utf8'));
+  async function request(path, token, body) {
+    const response = await fetch(host.url + path, { method: body === undefined ? 'GET' : 'POST',
+      headers: token ? { authorization: `Bearer ${token}` } : {}, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    return { code: response.status, body: await response.json() };
+  }
+  return { host, auth, outDir, request };
+}
+
+test('manager tokens scope commands and observations; public endpoints contain no private state', async t => {
+  const { auth, request, outDir } = await fixture(t);
+  assert.equal((await stat(resolve(outDir, 'auth.json'))).mode & 0o777, 0o600);
+  assert.equal((await request('/observe')).code, 401);
+  assert.equal((await request('/observe', auth.narrator)).code, 401);
+  const own = await request('/observe?actor=manager-b', auth.managers['manager-a']);
+  assert.equal(own.body.manager_view.club.id, 'a');
+  assert.equal(own.body.squad.length, 11);
+  assert.ok(own.body.squad.every(player => player.id.startsWith('a-')));
+  assert.ok(!JSON.stringify(own.body.fixtures).includes('seed'));
+  assert.equal((await request('/command', auth.managers['manager-a'], { actor: 'manager-b', id: 'hack', day: 1, command: 'Ready' })).code, 400);
+  assert.equal((await request('/command', 'outsider', { id: 'hack', day: 1, command: 'Ready' })).code, 401);
+  const crossClub = await request('/command', auth.managers['manager-a'], { id: 'foreign-lineup', day: 1,
+    command: { SetLineup: { player_ids: Array.from({ length: 11 }, (_, index) => `b-${index}`) } } });
+  assert.equal(crossClub.code, 400);
+  assert.ok(crossClub.body.error);
+  assert.equal(crossClub.body.receipt.result.Err, crossClub.body.error);
+  const publicState = await request('/public');
+  for (const secret of ['7654321', 'balance', 'match_plan', 'recovery_view', ...Object.values(auth.managers), auth.narrator]) {
+    assert.ok(!JSON.stringify(publicState.body).includes(secret), `Public leak: ${secret}`);
+  }
+  assert.equal(publicState.body.status, 'running');
+  const table = (await request('/table')).body;
+  assert.equal(table.day, 1); assert.equal(table.clubs.length, 2);
+  assert.deepEqual(table.last_results, []);
+  assert.ok(!JSON.stringify(table).includes('balance'));
+  const journal = await readFile(resolve(outDir, 'journal.jsonl'), 'utf8');
+  assert.ok(journal.split('\n').filter(Boolean).every(line => { const entry = JSON.parse(line); return entry.input && entry.output; }));
+  assert.equal((await request('/beat?after=9', auth.narrator)).code, 400);
+});
+
+test('all-ready advances and releases manager/narrator waits without narration blocking completion', async t => {
+  const { auth, request } = await fixture(t);
+  const waiting = request('/wait?after=1', auth.managers['manager-a']);
+  const beat = request('/beat?after=0', auth.narrator);
+  for (const token of Object.values(auth.managers)) {
+    const response = await request('/command', token, { id: 'ready', day: 1, command: 'Ready' });
+    assert.equal(response.body.result.Ok, 'Ready');
+  }
+  const advanced = await waiting;
+  assert.equal(advanced.body.status, 'completed');
+  assert.equal(advanced.body.observation.day, 2);
+  const events = (await beat).body;
+  assert.equal(events.next, 1); assert.equal(events.results.length, 1);
+  assert.equal(events.clubs.length, 2);
+  assert.ok(!('events' in events.results[0].report));
+  assert.ok(!('player_stats' in events.results[0].report));
+  assert.ok(Array.isArray(events.results[0].report.goals));
+  assert.equal(events.status, 'completed');
+  const final = (await request('/public')).body;
+  assert.equal(final.status, 'completed'); assert.ok(final.champions.length >= 1);
+  assert.ok(Array.isArray(final.results[0].report.events));
+  const table = (await request('/table')).body;
+  assert.deepEqual(table.last_results, events.results);
+  assert.equal((await request('/broadcast')).body.narrations.length, 0);
+  assert.equal((await request('/narration', auth.managers['manager-a'], { after: 0, through: 1, text: 'No' })).code, 401);
+  assert.equal((await request('/narration', auth.narrator, { after: 0, through: 2, text: 'Future' })).code, 400);
+  const item = { after: 0, through: 1, text: '<script>literal text</script>' };
+  assert.equal((await request('/narration', auth.narrator, item)).body.next, 1);
+  assert.equal((await request('/narration', auth.narrator, item)).code, 400);
+  assert.deepEqual((await request('/broadcast')).body.narrations, [item]);
+  assert.equal((await request('/command', auth.managers['manager-a'], { id: 'late', day: 2, command: 'Ready' })).code, 409);
+});
+
+test('prototype bot readies its club through the same command journal', async t => {
+  const source = scenario(); source.meta.external_managers = ['manager-a']; source.meta.bot_managers = ['manager-b'];
+  const { auth, request, outDir } = await fixture(t, source);
+  assert.deepEqual(Object.keys(auth.managers), ['manager-a']);
+  const beforeIdle = await readFile(resolve(outDir, 'journal.jsonl'), 'utf8');
+  await new Promise(resolveWait => setTimeout(resolveWait, 550));
+  assert.equal(await readFile(resolve(outDir, 'journal.jsonl'), 'utf8'), beforeIdle, 'Idle clock must not journal repeated full bot observations');
+  const offerRequest = { id: 'offer', day: 1, command: { Offer: { player_id: 'b-1', fee: 100 } } };
+  assert.equal((await request('/command', auth.managers['manager-a'], offerRequest)).code, 200);
+  await new Promise(resolveWait => setTimeout(resolveWait, 350));
+  const observation = (await request('/observe', auth.managers['manager-a'])).body;
+  assert.equal(observation.manager_view.offers[0].status, 'Rejected');
+  const waiting = request('/wait?after=1', auth.managers['manager-a']);
+  await request('/command', auth.managers['manager-a'], { id: 'ready', day: 1, command: 'Ready' });
+  assert.equal((await waiting).body.status, 'completed');
+  const entries = (await readFile(resolve(outDir, 'journal.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.ok(entries.some(entry => entry.input.actor === 'manager-b' && entry.input.request?.command === 'Ready'));
+});
+
+test('stalled and failing narration storage cannot block or fail the game', async t => {
+  const source = scenario();
+  source.init.fixtures.push({ id: 'return', day: 2, home: 'b', away: 'a', seed: 43 });
+  let releaseWriter, writerStarted;
+  const writerGate = new Promise(resolveWriter => { releaseWriter = resolveWriter; });
+  const started = new Promise(resolveStarted => { writerStarted = resolveStarted; });
+  t.after(() => releaseWriter());
+  const { auth, request } = await fixture(t, source, { writeBroadcast: async () => {
+    writerStarted(); await writerGate; throw new Error('Injected broadcast disk failure');
+  } });
+  for (const token of Object.values(auth.managers)) await request('/command', token, { id: 'ready-1', day: 1, command: 'Ready' });
+  assert.equal((await request('/wait?after=1', auth.managers['manager-a'])).body.status, 'running');
+  const narration = request('/narration', auth.narrator, { after: 0, through: 1, text: 'First fixture' });
+  await started;
+  for (const token of Object.values(auth.managers)) await request('/command', token, { id: 'ready-2', day: 2, command: 'Ready' });
+  assert.equal((await request('/wait?after=2', auth.managers['manager-a'])).body.status, 'completed');
+  releaseWriter();
+  assert.equal((await narration).code, 503);
+  assert.equal((await request('/public')).body.status, 'completed');
+  assert.deepEqual((await request('/broadcast')).body.narrations, []);
+});
