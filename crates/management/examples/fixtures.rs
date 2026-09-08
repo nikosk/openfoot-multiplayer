@@ -4,6 +4,10 @@ use management::{
     Club, Command, Management, Manager, Player, Request,
     football::{Fixture, Football},
 };
+use management::{
+    football::RecoverySetup,
+    recovery::{ClubRecovery, PlayerRecovery, RecoveryMode},
+};
 
 fn main() {
     let clubs = ["north", "south"].map(|id| Club {
@@ -78,7 +82,35 @@ fn main() {
             seed: 1002,
         },
     ];
+    let recovery = RecoverySetup {
+        seed: 1001,
+        players: attributes
+            .iter()
+            .map(|p| {
+                (
+                    p.id.clone(),
+                    PlayerRecovery {
+                        age: 25,
+                        morale: 60,
+                    },
+                )
+            })
+            .collect(),
+        clubs: ["north", "south"]
+            .iter()
+            .map(|id| {
+                (
+                    (*id).into(),
+                    ClubRecovery {
+                        physiotherapy: vec![],
+                        medical_level: 1,
+                    },
+                )
+            })
+            .collect(),
+    };
     let mut game = Football::new(management, attributes, fixtures).unwrap();
+    game.configure_recovery(recovery).unwrap();
     for club in ["north", "south"] {
         game.dispatch(
             &format!("manager-{club}"),
@@ -107,6 +139,23 @@ fn main() {
             );
         }
     }
+    let before = game.squad("manager-north").unwrap()[0].condition;
+    game.dispatch(
+        "manager-north",
+        Request {
+            id: "recovery".into(),
+            day: 3,
+            command: Command::SetRecovery {
+                mode: RecoveryMode::Recovery,
+            },
+        },
+        2100,
+    )
+    .unwrap()
+    .result
+    .unwrap();
+    assert!(game.advance_closed_day(3, 3000, 4000).unwrap().is_empty());
+    assert!(game.squad("manager-north").unwrap()[0].condition > before);
     println!(
         "{}",
         serde_json::to_string_pretty(&game.standings()).unwrap()

@@ -41,12 +41,28 @@ pub struct Standing {
     pub points: u32,
 }
 
+/// Explicit scenario inputs, not a client-editable physiology/finances backdoor.
+pub struct RecoverySetup {
+    pub seed: u64,
+    pub players: BTreeMap<String, crate::recovery::PlayerRecovery>,
+    pub clubs: BTreeMap<String, crate::recovery::ClubRecovery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryView {
+    pub mode: crate::recovery::RecoveryMode,
+    pub club: crate::recovery::ClubRecovery,
+    pub players: BTreeMap<String, crate::recovery::PlayerRecovery>,
+}
+
 pub struct Football {
     management: Management,
     attributes: BTreeMap<String, PlayerData>,
     fixtures: Vec<Fixture>,
     results: Vec<FinishedFixture>,
     standings: BTreeMap<String, Standing>,
+    recovery: Option<RecoverySetup>,
+    started: bool,
 }
 
 impl Football {
@@ -106,6 +122,8 @@ impl Football {
             fixtures,
             results: vec![],
             standings,
+            recovery: None,
+            started: false,
         })
     }
 
@@ -116,6 +134,66 @@ impl Football {
         now_ms: u64,
     ) -> Result<Receipt, Error> {
         self.management.dispatch(actor, request, now_ms)
+    }
+
+    pub fn configure_recovery(&mut self, setup: RecoverySetup) -> Result<(), String> {
+        if self.started || self.recovery.is_some() || self.management.sequence != 0 {
+            return Err(
+                "Recovery can only be configured once before commands or day processing".into(),
+            );
+        }
+        if setup.players.len() != self.attributes.len()
+            || setup.clubs.len() != self.management.clubs.len()
+            || setup
+                .players
+                .keys()
+                .any(|id| !self.attributes.contains_key(id))
+            || setup
+                .clubs
+                .keys()
+                .any(|id| !self.management.clubs.contains_key(id))
+        {
+            return Err("Recovery profiles must match world identities exactly".into());
+        }
+        for (id, attributes) in &self.attributes {
+            let club = &self.management.players[id].club_id;
+            let mut clone = attributes.clone();
+            let mut rng = rand::rngs::StdRng::seed_from_u64(setup.seed);
+            crate::recovery::recover(
+                &mut clone,
+                &setup.players[id],
+                &setup.clubs[club],
+                crate::recovery::RecoveryMode::Rest,
+                &mut rng,
+            )?;
+        }
+        for club in setup.clubs.values() {
+            crate::recovery::validate_club(club)?;
+        }
+        self.recovery = Some(setup);
+        self.management.recovery_enabled = true;
+        Ok(())
+    }
+
+    pub fn recovery_view(&self, actor: &str) -> Result<RecoveryView, Error> {
+        let club = self.management.manager_view(actor)?.club;
+        let setup = self.recovery.as_ref().ok_or(Error::Unavailable)?;
+        Ok(RecoveryView {
+            mode: self
+                .management
+                .recovery_modes
+                .get(&club.id)
+                .copied()
+                .unwrap_or(crate::recovery::RecoveryMode::Rest),
+            club: setup.clubs[&club.id].clone(),
+            players: self
+                .management
+                .players
+                .values()
+                .filter(|p| p.club_id == club.id)
+                .map(|p| (p.id.clone(), setup.players[&p.id].clone()))
+                .collect(),
+        })
     }
 
     pub fn manager_view(&self, actor: &str) -> Result<ManagerView, Error> {
@@ -213,6 +291,7 @@ impl Football {
         if !self.management.closed(now_ms) {
             return Err("Management window is still open".into());
         }
+        self.started = true;
         let mut staged = vec![];
         let mut staged_attributes = self.attributes.clone();
         for fixture in self.fixtures.iter().filter(|f| f.day == expected_day) {
@@ -245,6 +324,29 @@ impl Football {
                 home_starting_xi,
                 away_starting_xi,
             });
+        }
+        if staged.is_empty() {
+            if let Some(setup) = &self.recovery {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(
+                    setup.seed ^ u64::from(expected_day) ^ 0x7265_636f_7665_7279,
+                );
+                for (id, player) in &mut staged_attributes {
+                    let club = &self.management.players[id].club_id;
+                    let mode = self
+                        .management
+                        .recovery_modes
+                        .get(club)
+                        .copied()
+                        .unwrap_or(crate::recovery::RecoveryMode::Rest);
+                    crate::recovery::recover(
+                        player,
+                        &setup.players[id],
+                        &setup.clubs[club],
+                        mode,
+                        &mut rng,
+                    )?;
+                }
+            }
         }
         self.management
             .next_day(expected_day, now_ms, next_deadline_ms)

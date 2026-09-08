@@ -3,6 +3,7 @@
 pub mod football;
 pub mod matches;
 pub mod physical;
+pub mod recovery;
 pub mod selection;
 pub mod window;
 
@@ -32,6 +33,7 @@ pub struct Manager {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
+    SetRecovery { mode: recovery::RecoveryMode },
     SetLineup { player_ids: Vec<String> },
     Offer { player_id: String, fee: u64 },
     Review { offer_id: u64 },
@@ -90,6 +92,7 @@ pub struct Preview {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
+    RecoverySet,
     LineupSet,
     Offered(Offer),
     Preview(Preview),
@@ -156,6 +159,8 @@ pub struct Management {
     closed: bool,
     sequence: u64,
     lineups: BTreeMap<String, Vec<String>>,
+    recovery_modes: BTreeMap<String, recovery::RecoveryMode>,
+    recovery_enabled: bool,
 }
 
 impl Management {
@@ -198,6 +203,8 @@ impl Management {
             closed: false,
             sequence: 0,
             lineups: BTreeMap::new(),
+            recovery_modes: BTreeMap::new(),
+            recovery_enabled: false,
         })
     }
 
@@ -380,6 +387,16 @@ impl Management {
     fn execute(&mut self, actor: &str, command: &Command) -> Result<Outcome, Error> {
         let club = self.managers[actor].club_id.clone();
         match command {
+            Command::SetRecovery { mode } => {
+                if !self.recovery_enabled {
+                    return Err(Error::Unavailable);
+                }
+                if self.window.is_ready(actor) {
+                    return Err(Error::AlreadyReady);
+                }
+                self.recovery_modes.insert(club, *mode);
+                Ok(Outcome::RecoverySet)
+            }
             Command::SetLineup { player_ids } => {
                 if self.window.is_ready(actor) {
                     return Err(Error::AlreadyReady);

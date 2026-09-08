@@ -30,8 +30,11 @@ authentication. Explicit fixtures now resolve at closed daily windows. Full dail
 football consequences, contracts, calendar generation and native manager bots are
 still pending. Missing/departed selections now receive deterministic lineup repair,
 and played minutes carry condition/fitness effects into the next day. Fewer than
-eleven available players still prevents resolution; injury persistence, training
-recovery and emergency roster rules must be completed before autonomous careers.
+eleven available players still prevents resolution. Explicitly configured Rest and
+Recovery now restore condition on non-match days using upstream age/morale/staff/
+facility factors. Other training focuses, injury persistence and emergency roster
+rules must be completed before autonomous careers. The fixtures example supplies
+synthetic recovery profiles and verifies an off-day after its two matches.
 
 ## License and attribution
 

@@ -29,3 +29,9 @@ persistence orchestration are new and not claimed equivalent to upstream runs.
 preferred starters rather than applying the original low-survivor rebuild rule,
 and uses stable ID tie-breaking. Detailed formation-slot mapping is not ported.
 Both files retain GPLv3-or-later upstream attribution and document deviations.
+
+`crates/management/src/recovery.rs` adapts the uninjured Rest and Recovery-focus
+branches and factor functions from `ofm_core/src/training.rs` at the same revision.
+The host supplies explicit age/morale and physio/medical data; full player/staff
+domain integration is not claimed. Input validation and saturating condition
+addition are added at this boundary. The other training branches are not imported.

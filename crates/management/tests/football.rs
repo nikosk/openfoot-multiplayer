@@ -123,6 +123,73 @@ fn management() -> (Management, Vec<PlayerData>) {
     management_with_size(11)
 }
 
+#[test]
+fn configured_recovery_does_not_add_a_matchday_boost() {
+    use management::football::RecoverySetup;
+    use management::recovery::{ClubRecovery, PlayerRecovery};
+
+    let make_game = |enabled| {
+        let (management, attributes) = management_with_size(18);
+        let setup = RecoverySetup {
+            seed: 1001,
+            players: attributes
+                .iter()
+                .map(|p| {
+                    (
+                        p.id.clone(),
+                        PlayerRecovery {
+                            age: 25,
+                            morale: 60,
+                        },
+                    )
+                })
+                .collect(),
+            clubs: ["a", "b"]
+                .map(|id| {
+                    (
+                        id.into(),
+                        ClubRecovery {
+                            physiotherapy: vec![],
+                            medical_level: 1,
+                        },
+                    )
+                })
+                .into(),
+        };
+        let mut game = Football::new(
+            management,
+            attributes,
+            vec![Fixture {
+                id: "match".into(),
+                day: 1,
+                home: "a".into(),
+                away: "b".into(),
+                seed: 1001,
+            }],
+        )
+        .unwrap();
+        if enabled {
+            game.configure_recovery(setup).unwrap();
+        }
+        game
+    };
+    let mut enabled = make_game(true);
+    let mut disabled = make_game(false);
+    for game in [&mut enabled, &mut disabled] {
+        game.advance_closed_day(1, 1000, 2000).unwrap();
+    }
+    for club in ["a", "b"] {
+        assert_eq!(
+            serde_json::to_value(enabled.squad(club).unwrap()).unwrap(),
+            serde_json::to_value(disabled.squad(club).unwrap()).unwrap()
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(enabled.results()).unwrap(),
+        serde_json::to_value(disabled.results()).unwrap()
+    );
+}
+
 fn management_with_size(size: usize) -> (Management, Vec<PlayerData>) {
     let attributes: Vec<_> = ["a", "b"]
         .into_iter()
