@@ -876,6 +876,7 @@ fn both_saved_match_plans_seed_the_delegated_engine() {
         let (players, bench) =
             management::selection::select(&available, &game.lineup(club).unwrap()).unwrap();
         DelegatedTeam {
+            match_roles: None,
             team: engine::TeamData {
                 id: club.into(),
                 name: club.into(),

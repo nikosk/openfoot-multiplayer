@@ -215,6 +215,53 @@ fn oversized_line_is_drained_before_next_request() {
 }
 
 #[test]
+fn trusted_window_open_excludes_boot_work_but_cannot_extend_participant_work() {
+    let mut host = Host::start();
+    assert_eq!(host.send(init())["ok"], true);
+    assert_eq!(
+        host.send(json!({"op":"open_window","day":1,"now_ms":5000,"deadline_ms":6000}))["ok"],
+        true
+    );
+    assert_eq!(host.send(ready("manager-a"))["ok"], true);
+    assert_eq!(
+        host.send(json!({"op":"open_window","day":1,"now_ms":5500,"deadline_ms":6500}))["ok"],
+        false
+    );
+    let observation = host.send(json!({"op":"observe","actor":"manager-a"}));
+    assert_eq!(observation["data"]["deadline_ms"], 6000);
+}
+
+#[test]
+fn trusted_scenario_file_loads_large_artifact_and_does_not_replace_live_game() {
+    let path = std::env::temp_dir().join(format!(
+        "ofm-init-file-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    serde_json::to_writer(
+        file,
+        &json!({"init":init(),"meta":{"large_export_metadata":"x".repeat(8*1024*1024+1)}}),
+    )
+    .unwrap();
+    let mut host = Host::start();
+    let request = json!({"op":"init_file","path":path,"deadline_ms":4321});
+    assert_eq!(host.send(request.clone())["ok"], true);
+    let view = host.send(json!({"op":"observe","actor":"manager-a"}));
+    assert_eq!(view["ok"], true);
+    assert_eq!(view["data"]["deadline_ms"], 4321);
+    assert_eq!(host.send(request)["ok"], false);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schedule_can_be_generated_before_init_and_observation_filters_fixtures() {
     let mut host = Host::start();
     let schedule = host.send(json!({"op": "schedule", "club_ids": ["a", "b"],

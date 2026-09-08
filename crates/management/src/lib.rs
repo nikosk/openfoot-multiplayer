@@ -1,19 +1,47 @@
 //! Single-owner management commands. The host supplies authenticated identity and
 //! trusted time; neither belongs in an untrusted client command payload.
+pub mod aging;
+pub mod availability;
 pub mod board;
+pub mod bot_manager;
+pub mod bot_training;
 pub mod calendar;
 pub mod career;
 pub mod checkpoint;
+pub mod competition_schedule;
+pub mod competitions;
+pub mod contract_social;
 pub mod contracts;
+pub mod delegated_contracts;
+pub mod economy;
+pub mod economy_runtime;
+pub mod facilities;
 pub mod finances;
 pub mod football;
+pub mod inbox;
+pub mod market;
+pub mod market_rules;
 pub mod matches;
+pub mod national;
+pub mod news_runtime;
+pub mod personnel;
 pub mod physical;
+pub mod player_history;
+pub mod promotion;
 pub mod recovery;
+pub mod scouting;
 pub mod seasons;
 pub mod selection;
+pub mod social;
+pub mod squad_plan;
+pub mod staff;
+pub mod statistics;
 pub mod tactics;
+pub mod team_history;
+pub mod training;
+pub mod training_commands;
 pub mod window;
+pub mod youth;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -42,6 +70,12 @@ pub struct Manager {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Command {
+    Market(market::MarketCommand),
+    Economy(economy_runtime::EconomyCommand),
+    Personnel(personnel::PersonnelCommand),
+    Social(social::SocialCommand),
+    SetSquadPlan { plan: squad_plan::SquadPlan },
+    Training(training_commands::TrainingCommand),
     Career(career::CareerCommand),
     SetMatchPlan { plan: tactics::MatchPlan },
     SetRecovery { mode: recovery::RecoveryMode },
@@ -63,6 +97,8 @@ pub struct Request {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Error {
+    Personnel(String),
+    Social(String),
     Contract(String),
     InvalidSetup,
     Unauthorized,
@@ -106,6 +142,12 @@ pub struct Preview {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
+    Market(market::MarketOutcome),
+    Economy(economy_runtime::EconomyOutcome),
+    Personnel(serde_json::Value),
+    Social(social::SocialOutcome),
+    SquadPlanSet,
+    TrainingSet,
     Career(career::CareerOutcome),
     MatchPlanSet,
     RecoverySet,
@@ -183,6 +225,30 @@ pub struct Management {
     match_plans: BTreeMap<String, tactics::MatchPlan>,
     minimum_squad_size: usize,
     career: Option<career::CareerState>,
+    #[serde(default)]
+    training: Option<training_commands::TrainingSetup>,
+    #[serde(default)]
+    availability: Option<BTreeMap<String, availability::Availability>>,
+    #[serde(default)]
+    injury_events: Vec<(String, availability::InjuryEvent)>,
+    #[serde(default)]
+    squad_profiles: Option<BTreeMap<String, squad_plan::PositionProfile>>,
+    #[serde(default)]
+    squad_plans: BTreeMap<String, squad_plan::SquadPlan>,
+    #[serde(default)]
+    social: Option<social::SocialState>,
+    #[serde(default)]
+    personnel: Option<personnel::PersonnelState>,
+    #[serde(default)]
+    economy: Option<economy_runtime::EconomyState>,
+    #[serde(default)]
+    player_history: Option<player_history::PlayerHistoryState>,
+    #[serde(default)]
+    market: Option<market::MarketState>,
+    #[serde(default)]
+    team_history: Option<team_history::TeamHistoryState>,
+    #[serde(default)]
+    news: Option<news_runtime::NewsState>,
 }
 
 impl Management {
@@ -230,6 +296,18 @@ impl Management {
             match_plans: BTreeMap::new(),
             minimum_squad_size: 0,
             career: None,
+            training: None,
+            availability: None,
+            injury_events: vec![],
+            squad_profiles: None,
+            squad_plans: BTreeMap::new(),
+            social: None,
+            personnel: None,
+            economy: None,
+            player_history: None,
+            market: None,
+            team_history: None,
+            news: None,
         })
     }
 
@@ -324,6 +402,7 @@ impl Management {
     pub fn eliminate(&mut self, actor: &str) -> Result<(), Error> {
         let manager = self.managers.remove(actor).ok_or(Error::Unauthorized)?;
         self.career_manager_eliminated(actor);
+        self.market_manager_eliminated(actor);
         for offer in self.offers.values_mut() {
             if offer.status == OfferStatus::Pending
                 && (offer.buyer == manager.club_id || offer.seller == manager.club_id)
@@ -429,12 +508,74 @@ impl Management {
 
     fn execute(&mut self, actor: &str, command: &Command) -> Result<Outcome, Error> {
         let club = self.managers[actor].club_id.clone();
+        if self.market.is_some()
+            && matches!(
+                command,
+                Command::Offer { .. }
+                    | Command::Review { .. }
+                    | Command::Confirm { .. }
+                    | Command::Reject { .. }
+            )
+        {
+            return Err(Error::Unavailable);
+        }
         match command {
+            Command::Social(command) => {
+                let mut staged = self.clone();
+                let outcome = staged.execute_social(actor, command)?;
+                *self = staged;
+                Ok(Outcome::Social(outcome))
+            }
+            Command::Personnel(command) => {
+                let mut staged = self.clone();
+                let outcome = staged.execute_personnel(actor, command)?;
+                *self = staged;
+                Ok(Outcome::Personnel(outcome))
+            }
+            Command::Economy(command) => {
+                let mut staged = self.clone();
+                let outcome = staged.execute_economy(actor, command)?;
+                *self = staged;
+                Ok(Outcome::Economy(outcome))
+            }
+            Command::Market(command) => {
+                let mut staged = self.clone();
+                let outcome = staged.execute_market(actor, command)?;
+                *self = staged;
+                Ok(Outcome::Market(outcome))
+            }
+            Command::SetSquadPlan { plan } => {
+                if self.window.is_ready(actor) {
+                    return Err(Error::AlreadyReady);
+                }
+                let profiles = self.squad_profiles.as_ref().ok_or(Error::Unavailable)?;
+                let owned = profiles
+                    .iter()
+                    .filter(|(id, _)| self.players[*id].club_id == club)
+                    .map(|(id, profile)| (id.clone(), profile.clone()))
+                    .collect();
+                squad_plan::validate_plan(
+                    plan,
+                    &owned,
+                    self.lineups.get(&club).map(Vec::as_slice).unwrap_or(&[]),
+                )
+                .map_err(|_| Error::InvalidRequest)?;
+                self.squad_plans.insert(club, plan.clone());
+                Ok(Outcome::SquadPlanSet)
+            }
+            Command::Training(command) => {
+                self.execute_training(actor, command)?;
+                Ok(Outcome::TrainingSet)
+            }
             Command::Career(command) => {
                 if self.window.is_ready(actor) {
                     return Err(Error::AlreadyReady);
                 }
-                self.execute_career(actor, command).map(Outcome::Career)
+                let mut staged = self.clone();
+                let outcome = staged.execute_career(actor, command)?;
+                staged.sync_contract_social(command, &outcome)?;
+                *self = staged;
+                Ok(Outcome::Career(outcome))
             }
             Command::SetMatchPlan { plan } => {
                 if self.window.is_ready(actor) {
@@ -444,7 +585,7 @@ impl Management {
                 Ok(Outcome::MatchPlanSet)
             }
             Command::SetRecovery { mode } => {
-                if !self.recovery_enabled {
+                if !self.recovery_enabled || self.training.is_some() {
                     return Err(Error::Unavailable);
                 }
                 if self.window.is_ready(actor) {
@@ -460,11 +601,26 @@ impl Management {
                 let ids: std::collections::BTreeSet<_> = player_ids.iter().collect();
                 if ids.len() != 11
                     || player_ids.len() != 11
-                    || player_ids
-                        .iter()
-                        .any(|id| self.players.get(id).is_none_or(|p| p.club_id != club))
+                    || player_ids.iter().any(|id| {
+                        self.players.get(id).is_none_or(|p| p.club_id != club)
+                            || self
+                                .availability
+                                .as_ref()
+                                .is_some_and(|states| !states[id].is_available())
+                    })
                 {
                     return Err(Error::Unavailable);
+                }
+                if let Some(profiles) = &self.squad_profiles {
+                    let owned = profiles
+                        .iter()
+                        .filter(|(id, _)| self.players[*id].club_id == club)
+                        .map(|(id, profile)| (id.clone(), profile.clone()))
+                        .collect();
+                    let mut plan = self.squad_plans.get(&club).cloned().unwrap_or_default();
+                    squad_plan::reconcile_roles(&mut plan, &owned, player_ids)
+                        .map_err(|_| Error::InvalidRequest)?;
+                    self.squad_plans.insert(club.clone(), plan);
                 }
                 self.lineups.insert(club, player_ids.clone());
                 Ok(Outcome::LineupSet)

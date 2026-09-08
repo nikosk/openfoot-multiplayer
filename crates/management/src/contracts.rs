@@ -321,6 +321,8 @@ impl PlayerContract {
             / 7;
         weeks
             .checked_mul(i64::from(self.weekly_wage))
+            .and_then(|value| value.checked_add(51))
+            .map(|value| value / 52)
             .ok_or_else(|| "Severance overflow".into())
     }
 
@@ -521,8 +523,8 @@ mod tests {
         let mut player = profile();
         player.apply_agreement(date("2024-02-29"), 1234, 1).unwrap();
         assert_eq!(player.end_date, Some(date("2025-02-28")));
-        assert_eq!(player.severance(date("2025-02-20")).unwrap(), 2468);
-        assert_eq!(player.severance(date("2025-02-21")).unwrap(), 1234);
+        assert_eq!(player.severance(date("2025-02-20")).unwrap(), 48);
+        assert_eq!(player.severance(date("2025-02-21")).unwrap(), 24);
         assert_eq!(player.severance(date("2025-02-28")).unwrap(), 0);
         let today = date("2026-01-01");
         for (days, expected) in [

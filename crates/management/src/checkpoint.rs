@@ -70,6 +70,43 @@ impl Football {
 
     fn validate_checkpoint(&self) -> Result<(), String> {
         let m = &self.management;
+        if let Some(states) = &m.availability {
+            if states.keys().ne(m.players.keys()) {
+                return Err("Checkpoint availability registry mismatch".into());
+            }
+            for state in states.values() {
+                state.validate()?;
+            }
+        }
+        let mut injury_ids = BTreeSet::new();
+        if m.injury_events.iter().any(|(club, event)| {
+            !m.clubs.contains_key(club)
+                || !m.players.contains_key(&event.player_id)
+                || !injury_ids.insert(&event.id)
+                || event.injury.name.trim().is_empty()
+        }) {
+            return Err("Checkpoint injury event registry invalid".into());
+        }
+        if let Some(profiles) = &m.squad_profiles {
+            if profiles.keys().ne(m.players.keys()) || m.squad_plans.keys().ne(m.clubs.keys()) {
+                return Err("Checkpoint squad metadata mismatch".into());
+            }
+            crate::squad_plan::validate_profiles(profiles)?;
+            for (club, plan) in &m.squad_plans {
+                let owned = profiles
+                    .iter()
+                    .filter(|(id, _)| m.players[*id].club_id == *club)
+                    .map(|(id, p)| (id.clone(), p.clone()))
+                    .collect();
+                crate::squad_plan::validate_plan(
+                    plan,
+                    &owned,
+                    m.lineups.get(club).map(Vec::as_slice).unwrap_or(&[]),
+                )?;
+            }
+        } else if !m.squad_plans.is_empty() {
+            return Err("Checkpoint squad plans lack profiles".into());
+        }
         let fail = |message: &str| Err::<(), String>(format!("Invalid checkpoint: {message}"));
         if m.clubs.is_empty() || m.managers.is_empty() {
             return fail("empty clubs or active managers");
@@ -208,6 +245,19 @@ impl Football {
         self.validate_fixture_checkpoint()?;
         self.validate_board_checkpoint()?;
         m.validate_career_checkpoint()?;
+        m.validate_social_checkpoint()?;
+        m.validate_economy_checkpoint()?;
+        m.validate_personnel_checkpoint()?;
+        m.validate_market_checkpoint()?;
+        self.validate_player_history_checkpoint()?;
+        self.validate_competition_checkpoint()?;
+        self.validate_national_checkpoint()?;
+        self.validate_team_history_checkpoint()?;
+        self.validate_news_checkpoint()?;
+        self.validate_statistics_checkpoint()?;
+        if let Some(training) = &m.training {
+            self.validate_training_setup(training)?;
+        }
         self.validate_season_checkpoint()?;
         Ok(())
     }
@@ -217,21 +267,39 @@ impl Football {
         let mut fixture_ids = BTreeMap::new();
         let mut slots = BTreeSet::new();
         let current_ids: BTreeSet<_> = self.fixtures.iter().map(|fixture| &fixture.id).collect();
+        if current_ids.len() != self.fixtures.len() {
+            return Err("Duplicate current checkpoint fixture".into());
+        }
         let archived = self
             .seasons
             .iter()
             .flat_map(|state| &state.archives)
-            .flat_map(|archive| &archive.fixtures);
+            .flat_map(|archive| &archive.fixtures)
+            .chain(
+                self.competitions
+                    .iter()
+                    .flat_map(|state| &state.archives)
+                    .flat_map(|archive| &archive.summary.fixtures),
+            );
         for fixture in self.fixtures.iter().chain(archived) {
             if fixture.id.trim().is_empty()
-                || fixture_ids.insert(&fixture.id, fixture).is_some()
                 || fixture.home == fixture.away
                 || !clubs.contains_key(&fixture.home)
                 || !clubs.contains_key(&fixture.away)
-                || !slots.insert((fixture.day, &fixture.home))
-                || !slots.insert((fixture.day, &fixture.away))
+                || (self.competitions.is_none()
+                    && (!slots.insert((fixture.day, &fixture.home))
+                        || !slots.insert((fixture.day, &fixture.away))))
             {
                 return Err("Invalid checkpoint fixture calendar".into());
+            }
+            if let Some(previous) = fixture_ids.insert(&fixture.id, fixture) {
+                // Foreign calendars can remain active across primary-season archives.
+                if self.competitions.is_none()
+                    || (previous.day, &previous.home, &previous.away, previous.seed)
+                        != (fixture.day, &fixture.home, &fixture.away, fixture.seed)
+                {
+                    return Err("Conflicting checkpoint fixture identity".into());
+                }
             }
         }
         let mut expected: BTreeMap<_, _> = clubs
@@ -252,6 +320,65 @@ impl Football {
                 )
             })
             .collect();
+        let mut imported_completed = BTreeSet::new();
+        let mut source_results = BTreeMap::new();
+        if let Some(state) = &self.competitions {
+            let primary = state
+                .setup
+                .competitions
+                .get(&state.setup.primary_competition_id)
+                .ok_or("Missing primary competition")?;
+            expected = primary
+                .standings
+                .iter()
+                .map(|s| {
+                    (
+                        s.team_id.clone(),
+                        Standing {
+                            club_id: s.team_id.clone(),
+                            played: s.played,
+                            won: s.won,
+                            drawn: s.drawn,
+                            lost: s.lost,
+                            goals_for: s.goals_for,
+                            goals_against: s.goals_against,
+                            points: s.points,
+                        },
+                    )
+                })
+                .collect();
+            // The competition validator independently rebuilds these standings
+            // from source scorelines, including matches preceding this runtime.
+            for competition in state
+                .setup
+                .competitions
+                .values()
+                .chain(state.archives.iter().flat_map(|a| a.competitions.values()))
+            {
+                for fixture in &competition.fixtures {
+                    if let Some(result) = &fixture.result {
+                        let identity = (
+                            &fixture.date,
+                            &fixture.home_team_id,
+                            &fixture.away_team_id,
+                            result.home_goals,
+                            result.away_goals,
+                        );
+                        if source_results
+                            .insert(fixture.id.clone(), identity)
+                            .is_some_and(|prior| prior != identity)
+                        {
+                            return Err("Conflicting archived source fixture result".into());
+                        }
+                    }
+                    if fixture.status == domain::league::FixtureStatus::Completed
+                        && fixture.date <= state.epoch_date.to_string()
+                    {
+                        imported_completed.insert(fixture.id.clone());
+                    }
+                }
+            }
+        }
         let mut results = BTreeSet::new();
         for result in &self.results {
             let fixture = fixture_ids
@@ -271,6 +398,18 @@ impl Football {
             {
                 return Err("Invalid checkpoint result references".into());
             }
+            if self.competitions.is_some()
+                && !source_results
+                    .get(&result.fixture_id)
+                    .is_some_and(|(_, home, away, hg, ag)| {
+                        *home == &result.home
+                            && *away == &result.away
+                            && *hg == result.report.home_goals
+                            && *ag == result.report.away_goals
+                    })
+            {
+                return Err("Runtime report disagrees with source fixture result".into());
+            }
             let starters: BTreeSet<_> = result
                 .home_starting_xi
                 .iter()
@@ -284,7 +423,10 @@ impl Football {
                 return Err("Invalid checkpoint historical starting lineups".into());
             }
             // The canonical trajectory spans seasons; the active table does not.
-            if !current_ids.contains(&result.fixture_id) {
+            if self.competitions.is_some()
+                || !current_ids.contains(&result.fixture_id)
+                || !self.primary_competition_contains_fixture(&result.fixture_id)
+            {
                 continue;
             }
             for (club, gf, ga) in [
@@ -324,7 +466,9 @@ impl Football {
         }
         if expected != self.standings
             || fixture_ids.values().any(|fixture| {
-                fixture.day < self.management.window.day && !results.contains(&fixture.id)
+                fixture.day < self.management.window.day
+                    && !results.contains(&fixture.id)
+                    && !imported_completed.contains(&fixture.id)
             })
         {
             return Err("Checkpoint standings or completed-fixture coverage mismatch".into());
@@ -345,8 +489,14 @@ impl Football {
             let record = boards
                 .get(&manager.id)
                 .ok_or("Checkpoint active manager has no board")?;
+            let league_size = self
+                .club_competition_standings(&manager.club_id)
+                .map_or(m.clubs.len(), |rows| rows.len());
             if record.dismissed_day.is_some() || record.club_id != manager.club_id {
                 return Err("Checkpoint dismissed manager remains authorized".into());
+            }
+            if record.state.league_size as usize != league_size {
+                return Err("Checkpoint active board division size mismatch".into());
             }
         }
         for (id, board) in boards {
@@ -354,7 +504,6 @@ impl Football {
                 || !m.clubs.contains_key(&board.club_id)
                 || board.state.satisfaction > 100
                 || board.state.warning_stage > 2
-                || board.state.league_size as usize != m.clubs.len()
                 || board.state.objectives
                     != crate::board::ObjectiveTargets::new(
                         board.reputation,
@@ -447,6 +596,189 @@ mod tests {
         )]))
         .unwrap();
         game
+    }
+
+    #[test]
+    fn cannot_delete_an_unplayed_legacy_club_from_standings() {
+        let mut game = game();
+        game.standings.clear();
+        assert!(game.save_state().unwrap_err().contains("standings"));
+    }
+
+    #[test]
+    fn imported_scorelines_need_no_synthetic_engine_reports_but_new_matches_do() {
+        let mut game = game();
+        game.management.clubs.insert(
+            "other".into(),
+            Club {
+                id: "other".into(),
+                name: "Other".into(),
+                balance: 0,
+            },
+        );
+        let mut league = domain::league::League::new(
+            "league".into(),
+            "League".into(),
+            2026,
+            &["club".into(), "other".into()],
+        );
+        league.standings[0].record_result(2, 0);
+        league.standings[1].record_result(0, 2);
+        league.fixtures.push(domain::league::Fixture {
+            id: "imported".into(),
+            competition_id: "league".into(),
+            date: "2026-06-01".into(),
+            home_team_id: "club".into(),
+            away_team_id: "other".into(),
+            status: domain::league::FixtureStatus::Completed,
+            result: Some(domain::league::MatchResult {
+                home_goals: 2,
+                away_goals: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        game.standings = league
+            .standings
+            .iter()
+            .map(|s| {
+                (
+                    s.team_id.clone(),
+                    Standing {
+                        club_id: s.team_id.clone(),
+                        played: s.played,
+                        won: s.won,
+                        drawn: s.drawn,
+                        lost: s.lost,
+                        goals_for: s.goals_for,
+                        goals_against: s.goals_against,
+                        points: s.points,
+                    },
+                )
+            })
+            .collect();
+        game.competitions = Some(crate::competitions::CompetitionState {
+            epoch_date: "2026-06-01".parse().unwrap(),
+            epoch_day: 1,
+            archives: vec![],
+            setup: crate::competitions::CompetitionSetup {
+                seed: 1,
+                primary_competition_id: "league".into(),
+                competitions: [("league".into(), league)].into(),
+                active_competition_ids: ["league".into()].into(),
+                competition_order: vec!["league".into()],
+                catch_up_past: false,
+                club_regions: Default::default(),
+            },
+        });
+        game.fixtures.push(crate::football::Fixture {
+            id: "imported".into(),
+            day: 1,
+            home: "club".into(),
+            away: "other".into(),
+            seed: 1,
+        });
+        game.management.window.day = 2;
+        game.validate_fixture_checkpoint().unwrap();
+        let date = "2026-06-01".parse().unwrap();
+        let archive = crate::competitions::CompetitionArchive {
+            competitions: game
+                .competitions
+                .as_ref()
+                .unwrap()
+                .setup
+                .competitions
+                .clone(),
+            summary: crate::seasons::SeasonArchive {
+                season: 2026,
+                completed_day: 1,
+                completed_date: date,
+                next_first_day: 3,
+                next_start_date: date,
+                fixtures: game.fixtures.clone(),
+                results: vec![],
+                standings: vec![],
+                prizes: Default::default(),
+                reputations_before: Default::default(),
+                reputations_after: Default::default(),
+                manager_outcomes: Default::default(),
+            },
+        };
+        game.competitions.as_mut().unwrap().archives.push(archive);
+        game.validate_fixture_checkpoint().unwrap();
+        game.competitions.as_mut().unwrap().archives[0]
+            .summary
+            .fixtures[0]
+            .seed = 99;
+        assert!(game.validate_fixture_checkpoint().is_err());
+        game.competitions.as_mut().unwrap().archives.clear();
+        game.competitions
+            .as_mut()
+            .unwrap()
+            .setup
+            .competitions
+            .get_mut("league")
+            .unwrap()
+            .fixtures[0]
+            .date = "2026-06-02".into();
+        assert!(game.validate_fixture_checkpoint().is_err());
+    }
+
+    #[test]
+    fn boards_validate_current_division_but_preserve_dismissed_division_size() {
+        let mut game = game();
+        for (day, now, next) in [(1, 100, 200), (2, 200, 300)] {
+            game.advance_closed_day(day, now, next).unwrap();
+        }
+        let replacement = game.dismissals()[0].replacement_manager_id.clone();
+        for id in ["other", "foreign"] {
+            game.management.clubs.insert(
+                id.into(),
+                Club {
+                    id: id.into(),
+                    name: id.into(),
+                    balance: 0,
+                },
+            );
+        }
+        let league = domain::league::League::new(
+            "league".into(),
+            "League".into(),
+            2026,
+            &["club".into(), "other".into()],
+        );
+        game.competitions = Some(crate::competitions::CompetitionState {
+            epoch_date: "2026-06-01".parse().unwrap(),
+            epoch_day: 1,
+            archives: vec![],
+            setup: crate::competitions::CompetitionSetup {
+                seed: 1,
+                primary_competition_id: "league".into(),
+                competitions: [("league".into(), league)].into(),
+                active_competition_ids: ["league".into()].into(),
+                competition_order: vec!["league".into()],
+                catch_up_past: false,
+                club_regions: Default::default(),
+            },
+        });
+        let boards = game.boards.as_mut().unwrap();
+        let current = boards.get_mut(&replacement).unwrap();
+        current
+            .state
+            .reset_objectives(current.reputation, 2)
+            .unwrap();
+        assert_eq!(boards["manager"].state.league_size, 1);
+        game.validate_board_checkpoint().unwrap();
+        let current = game.boards.as_mut().unwrap().get_mut(&replacement).unwrap();
+        current
+            .state
+            .reset_objectives(current.reputation, 3)
+            .unwrap();
+        assert!(
+            game.validate_board_checkpoint()
+                .unwrap_err()
+                .contains("division size")
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::contracts::{Decision, PlayerContract, wage_policy_allows};
 use crate::{Error, Management, OfferStatus};
 use chrono::{Datelike, Days, NaiveDate, Weekday};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CareerSetup {
@@ -20,6 +20,8 @@ pub struct CareerSetup {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CareerState {
+    #[serde(default)]
+    initial_retired_player_ids: BTreeSet<String>,
     pub today: NaiveDate,
     pub contracts: BTreeMap<String, PlayerContract>,
     pub wage_budgets: BTreeMap<String, u64>,
@@ -76,6 +78,7 @@ impl ContractAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CareerCommand {
+    Delegate(crate::delegated_contracts::Delegation),
     Review { action: ContractAction },
     Confirm { preview_id: u64 },
     LetExpire { player_id: String, enabled: bool },
@@ -94,6 +97,7 @@ pub struct CareerPreview {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CareerOutcome {
+    Delegated(serde_json::Value),
     Preview(CareerPreview),
     RefreshRequired(CareerPreview),
     Decision {
@@ -162,6 +166,21 @@ impl Management {
         let Some(career) = &self.career else {
             return Ok(());
         };
+        for id in &career.initial_retired_player_ids {
+            if !self.players.get(id).is_some_and(|p| p.club_id.is_empty())
+                || !career
+                    .contracts
+                    .get(id)
+                    .is_some_and(|c| c.end_date.is_none())
+                || !self
+                    .social
+                    .as_ref()
+                    .and_then(|s| s.source_players.get(id))
+                    .is_some_and(|p| p.retired && p.team_id.is_none() && p.contract_end.is_none())
+            {
+                return Err("Invalid retired bootstrap checkpoint metadata".into());
+            }
+        }
         if career.contracts.len() != self.players.len()
             || self
                 .players
@@ -186,7 +205,12 @@ impl Management {
         for (id, contract) in &career.contracts {
             contract.validate(career.today)?;
             if self.players[id].club_id.is_empty() {
-                if contract.end_date.is_some() || contract.weekly_wage != 0 {
+                let retired = self
+                    .social
+                    .as_ref()
+                    .and_then(|social| social.source_players.get(id))
+                    .is_some_and(|player| player.retired);
+                if contract.end_date.is_some() || (contract.weekly_wage != 0 && !retired) {
                     return Err("Active free-agent contract in checkpoint".into());
                 }
             } else if contract.end_date.is_some_and(|end| end < career.today) {
@@ -257,6 +281,16 @@ impl Management {
         self.clubs
             .iter()
             .map(|(id, club)| {
+                if self.economy.is_some() {
+                    let (_, snapshot) = self.economy_finance(id)?;
+                    return Ok((
+                        id.clone(),
+                        crate::football::BoardFinance {
+                            wage_usage_percent: snapshot.wage_budget_usage_percent,
+                            in_debt: snapshot.currently_in_debt,
+                        },
+                    ));
+                }
                 let total = self.contract_wage_total(career, id)?;
                 let usage = (u128::from(total) * 100 / u128::from(career.wage_budgets[id].max(1)))
                     .min(u128::from(u32::MAX)) as u32;
@@ -309,6 +343,15 @@ impl Management {
         Ok(())
     }
     pub fn configure_career(&mut self, setup: CareerSetup) -> Result<(), String> {
+        self.configure_career_with_retired(setup, BTreeSet::new())
+    }
+
+    /// Trusted bootstrap metadata, subsequently checked against the source registry.
+    pub fn configure_career_with_retired(
+        &mut self,
+        setup: CareerSetup,
+        retired_player_ids: BTreeSet<String>,
+    ) -> Result<(), String> {
         if self.career.is_some() || self.sequence != 0 {
             return Err("Career can only be configured once before commands".into());
         }
@@ -336,10 +379,21 @@ impl Management {
         {
             return Err("Club reputation must be 0..=1000".into());
         }
+        for id in &retired_player_ids {
+            if !self.players.get(id).is_some_and(|p| p.club_id.is_empty())
+                || !setup
+                    .contracts
+                    .get(id)
+                    .is_some_and(|c| c.end_date.is_none())
+            {
+                return Err("Retired bootstrap player must be registered, unowned and without a contract end".into());
+            }
+        }
         for (id, contract) in &setup.contracts {
             contract.validate(setup.today)?;
             if self.players[id].club_id.is_empty()
-                && (contract.end_date.is_some() || contract.weekly_wage != 0)
+                && (contract.end_date.is_some()
+                    || (contract.weekly_wage != 0 && !retired_player_ids.contains(id)))
             {
                 return Err("Free agent cannot have an active salary or contract".into());
             }
@@ -350,6 +404,7 @@ impl Management {
             }
         }
         let state = CareerState {
+            initial_retired_player_ids: retired_player_ids,
             today: setup.today,
             contracts: setup.contracts,
             wage_budgets: setup.wage_budgets,
@@ -368,11 +423,41 @@ impl Management {
         Ok(())
     }
 
+    pub(crate) fn validate_initial_retired_source(
+        &self,
+        players: &BTreeMap<String, domain::player::Player>,
+    ) -> Result<(), String> {
+        let Some(career) = &self.career else {
+            return Ok(());
+        };
+        let retired: BTreeSet<_> = players
+            .iter()
+            .filter(|(_, p)| p.retired)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if retired != career.initial_retired_player_ids
+            || retired
+                .iter()
+                .any(|id| players[id].team_id.is_some() || players[id].contract_end.is_some())
+        {
+            return Err("Retired bootstrap declaration does not match source players".into());
+        }
+        Ok(())
+    }
+
     pub fn career_date(&self) -> Option<NaiveDate> {
         self.career.as_ref().map(|career| career.today)
     }
 
-    fn contract_wage_total(&self, career: &CareerState, club: &str) -> Result<u64, String> {
+    pub(crate) fn contract_wage_total(
+        &self,
+        career: &CareerState,
+        club: &str,
+    ) -> Result<u64, String> {
+        if self.economy.is_some() {
+            return u64::try_from(self.economy_finance(club)?.1.annual_wage_bill)
+                .map_err(|_| "Invalid wage bill".into());
+        }
         self.players
             .values()
             .filter(|p| p.club_id == club)
@@ -398,7 +483,7 @@ impl Management {
         let contracts: BTreeMap<String, PlayerContract> = self
             .players
             .values()
-            .filter(|p| &p.club_id == club)
+            .filter(|p| self.contract_owner(&p.id) == Some(club.as_str()))
             .map(|p| (p.id.clone(), career.contracts[&p.id].clone()))
             .collect();
         let renewal_terms = contracts
@@ -420,7 +505,14 @@ impl Management {
         let free_agents = self
             .players
             .values()
-            .filter(|p| p.club_id.is_empty())
+            .filter(|p| {
+                p.club_id.is_empty()
+                    && !self.social.as_ref().is_some_and(|s| {
+                        s.source_players
+                            .get(&p.id)
+                            .is_some_and(|source| source.retired)
+                    })
+            })
             .map(|player| {
                 let contract = career
                     .negotiations
@@ -465,16 +557,34 @@ impl Management {
             .players
             .get(action.player_id())
             .ok_or(Error::Unavailable)?;
+        if matches!(action, ContractAction::Renew { .. }) {
+            self.validate_social_renewal(actor, &player.id)?;
+        }
         match action {
+            ContractAction::Sign { .. }
+                if self.social.as_ref().is_some_and(|s| {
+                    s.source_players.get(&player.id).is_some_and(|p| p.retired)
+                }) =>
+            {
+                return Err(Error::Unavailable);
+            }
             ContractAction::Sign { .. } if !player.club_id.is_empty() => {
                 return Err(Error::Unavailable);
             }
             ContractAction::Renew { .. } | ContractAction::Terminate { .. }
-                if &player.club_id != club =>
+                if self.contract_owner(&player.id) != Some(club.as_str()) =>
             {
                 return Err(Error::Unavailable);
             }
             _ => {}
+        }
+        if matches!(action, ContractAction::Terminate { .. })
+            && self
+                .social
+                .as_ref()
+                .is_some_and(|s| s.source_players[&player.id].active_loan.is_some())
+        {
+            return Err(Error::Contract("Cannot terminate an active loan".into()));
         }
         let contract = career.contracts[&player.id].clone();
         let negotiation = if matches!(action, ContractAction::Sign { .. }) {
@@ -538,8 +648,8 @@ impl Management {
                     }
                     projected = dep
                         .wage_total
-                        .checked_sub(u64::from(old))
-                        .and_then(|v| v.checked_add(u64::from(*weekly_wage)))
+                        .saturating_sub(u64::from(old))
+                        .checked_add(u64::from(*weekly_wage))
                         .ok_or(Error::Overflow)?;
                     negotiated
                         .apply_agreement(dep.date, *weekly_wage, *years)
@@ -597,6 +707,9 @@ impl Management {
             return Err(Error::Unavailable);
         }
         match command {
+            CareerCommand::Delegate(options) => self
+                .delegate_contracts(actor, options)
+                .map(CareerOutcome::Delegated),
             CareerCommand::LetExpire { player_id, enabled } => {
                 if self
                     .players
@@ -712,6 +825,28 @@ impl Management {
                     .insert(view.player_id.clone(), player_revision);
                 self.club_revisions.insert(club.clone(), club_revision);
                 if matches!(view.action, ContractAction::Terminate { .. }) {
+                    if let Some(economy) = &mut self.economy {
+                        let account = economy
+                            .setup
+                            .clubs
+                            .get_mut(&club)
+                            .ok_or(Error::Unavailable)?;
+                        account.season_expenses = account
+                            .season_expenses
+                            .checked_add(view.severance)
+                            .ok_or(Error::Overflow)?;
+                        account
+                            .financial_ledger
+                            .push(domain::team::FinancialTransaction {
+                                date: dependencies.date.to_string(),
+                                description: format!(
+                                    "be.msg.contractTerminated.ledgerDescription?player={}",
+                                    self.players[&view.player_id].name
+                                ),
+                                amount: -view.severance,
+                                kind: domain::team::FinancialTransactionKind::ContractTermination,
+                            });
+                    }
                     self.clubs.get_mut(&club).unwrap().balance = view.balance_after;
                     self.career.as_mut().unwrap().ledger.push(LedgerEntry {
                         date: dependencies.date,
@@ -719,6 +854,12 @@ impl Management {
                         amount: -view.severance,
                         reason: "contract_termination".into(),
                     });
+                    self.contract_event(
+                        &view.player_id,
+                        &self.players[&view.player_id].club_id.clone(),
+                        "terminated",
+                        Some(("severance", view.severance.to_string())),
+                    )?;
                     self.release_contract(&view.player_id, "terminated");
                 } else {
                     self.contract_transferred(&view.player_id);
@@ -732,6 +873,7 @@ impl Management {
     }
 
     pub(crate) fn contract_transferred(&mut self, player_id: &str) {
+        self.remove_training_membership(player_id);
         if let Some(career) = &mut self.career {
             career
                 .negotiations
@@ -743,8 +885,40 @@ impl Management {
     }
 
     fn release_contract(&mut self, player_id: &str, reason: &str) {
+        self.market_contract_released(player_id);
+        let contract_owner = self.contract_owner(player_id).map(str::to_owned);
         let player = self.players.get_mut(player_id).unwrap();
-        let old_club = std::mem::take(&mut player.club_id);
+        let registration_club = std::mem::take(&mut player.club_id);
+        let old_club = contract_owner.unwrap_or(registration_club);
+        if let Some(social) = &mut self.social {
+            let source = social.source_players.get_mut(player_id).unwrap();
+            source.team_id = None;
+            source.active_loan = None;
+            source.contract_end = None;
+            source.wage = 0;
+            source.transfer_listed = false;
+            source.loan_listed = false;
+            source.transfer_offers.clear();
+            source.loan_offers.clear();
+            source.morale_core.renewal_state = None;
+            source
+                .movement_history
+                .push(domain::player::PlayerMovementEntry {
+                    date: self.career.as_ref().unwrap().today.to_string(),
+                    kind: domain::player::PlayerMovementKind::Released,
+                    from_team_id: Some(old_club.clone()),
+                    from_team_name: self.clubs.get(&old_club).map(|c| c.name.clone()),
+                    to_team_id: None,
+                    to_team_name: None,
+                    fee: None,
+                    loan_end_date: None,
+                });
+        }
+        if let Some(personnel) = &mut self.personnel {
+            for team in personnel.teams.values_mut() {
+                team.remove_player_references(player_id);
+            }
+        }
         let career = self.career.as_mut().unwrap();
         let contract = career.contracts.get_mut(player_id).unwrap();
         contract.weekly_wage = 0;
@@ -763,6 +937,19 @@ impl Management {
         for lineup in self.lineups.values_mut() {
             lineup.retain(|id| id != player_id);
         }
+        for plan in self.squad_plans.values_mut() {
+            plan.player_roles.remove(player_id);
+            for role in [
+                &mut plan.match_roles.captain,
+                &mut plan.match_roles.penalty_taker,
+                &mut plan.match_roles.free_kick_taker,
+                &mut plan.match_roles.corner_taker,
+            ] {
+                if role.as_deref() == Some(player_id) {
+                    *role = None;
+                }
+            }
+        }
         for offer in self
             .offers
             .values_mut()
@@ -778,6 +965,27 @@ impl Management {
     /// Exactly one following calendar date. Stage balance/revision arithmetic
     /// before publishing any expiry or wage charge; expiry has no roster exemption.
     pub fn advance_career(&mut self, next_date: NaiveDate) -> Result<(), Error> {
+        let mut staged = self.clone();
+        staged.advance_career_inner(next_date)?;
+        *self = staged;
+        Ok(())
+    }
+
+    pub(crate) fn contract_owner(&self, player_id: &str) -> Option<&str> {
+        self.social
+            .as_ref()
+            .and_then(|s| s.source_players.get(player_id))
+            .and_then(|p| p.active_loan.as_ref())
+            .map(|loan| loan.parent_team_id.as_str())
+            .or_else(|| {
+                self.players
+                    .get(player_id)
+                    .filter(|p| !p.club_id.is_empty())
+                    .map(|p| p.club_id.as_str())
+            })
+    }
+
+    fn advance_career_inner(&mut self, next_date: NaiveDate) -> Result<(), Error> {
         let Some(career) = self.career.as_ref() else {
             return Ok(());
         };
@@ -810,7 +1018,7 @@ impl Management {
             let revision = club_revisions[club].checked_add(1).ok_or(Error::Overflow)?;
             club_revisions.insert(club.clone(), revision);
         }
-        if closing_date.weekday() == Weekday::Mon {
+        if closing_date.weekday() == Weekday::Mon && self.economy.is_none() {
             for club in self.clubs.keys() {
                 let mut wages = self
                     .players
@@ -847,6 +1055,9 @@ impl Management {
             }
         }
         for (id, _) in expired {
+            if let Some(club) = self.contract_owner(&id).map(str::to_owned) {
+                self.contract_event(&id, &club, "expired", None)?;
+            }
             self.release_contract(&id, "expired");
         }
         for (id, balance) in balances {
@@ -854,6 +1065,7 @@ impl Management {
         }
         self.club_revisions = club_revisions;
         self.player_revisions = player_revisions;
+        self.settle_economy()?;
         let career = self.career.as_mut().unwrap();
         career.today = next_date;
         career.ledger.extend(ledger);

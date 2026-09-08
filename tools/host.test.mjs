@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
-import { startHost } from './host.mjs';
+import { startHost, createSpectatorBeats } from './host.mjs';
 import { replayJournal } from './replay.mjs';
 
 function scenario() {
@@ -22,6 +22,26 @@ function scenario() {
     fixtures: [{ id: 'final', day: 1, home: 'a', away: 'b', seed: 42 }] },
     meta: { external_managers: managers.map(manager => manager.id), bot_managers: [] } };
 }
+
+test('preparation beats are retrospective, weekly, bounded and independent of match cursor', () => {
+  const state = createSpectatorBeats();
+  const news = [{ id: 'transfer', date: '2026-06-03', headline: 'Completed transfer' },
+    { id: 'future', date: '2026-06-09', headline: 'Not yet' }];
+  for (let day = 1; day <= 7; day++) state.commit({ day, date: `2026-06-0${day}`, news });
+  assert.equal(state.beats.length, 1);
+  assert.equal(state.beats[0].kind, 'preparation');
+  assert.deepEqual(state.beats[0].results, []);
+  assert.deepEqual(state.beats[0].news.map(item => item.id), ['transfer']);
+  assert.equal(state.beats[0].from_day, 1);
+  assert.equal(state.beats[0].through_day, 7);
+  state.commit({ day: 8, date: '2026-06-08', news, terminal: true });
+  assert.equal(state.beats.length, 2);
+  assert.deepEqual(state.beats[1].news, []);
+  const many = createSpectatorBeats();
+  many.commit({ day: 1, date: '2026-06-01', terminal: true,
+    news: Array.from({length: 45}, (_, i) => ({id: String(i), date: '2026-06-01'})) });
+  assert.deepEqual(many.beats.map(beat => beat.news.length), [20, 20, 5]);
+});
 
 async function fixture(t, source = scenario(), options = {}) {
   const temp = await mkdtemp(resolve(tmpdir(), 'league-host-test-'));
@@ -53,6 +73,16 @@ function careerScenario() {
     { reputation: 700, initial_satisfaction: 50 }]));
   source.init.seasons = { season: 2026, season_start_month: 8, season_start_day: 1, spacing_days: 7, seed: 1001, division_tier: 0 };
   return source;
+}
+
+async function waitForBotReady(outDir,actor) {
+  const until=Date.now()+5000;
+  while(Date.now()<until) {
+    const rows=(await readFile(resolve(outDir,'journal.jsonl'),'utf8')).trim().split('\n').flatMap(line=>{try{return [JSON.parse(line)];}catch{return [];}});
+    if(rows.at(-1)?.input.op==='managers' && rows.some(row=>row.input.op==='command' && row.input.actor===actor && row.output.data?.result?.Ok==='Ready'))return;
+    await new Promise(resolveWait=>setTimeout(resolveWait,20));
+  }
+  assert.fail(`Bot ${actor} did not finish its initial asynchronous decision batch`);
 }
 
 test('season completion uses archived final table and keeps private board/contracts out of spectator API', async t => {
@@ -91,6 +121,7 @@ test('prototype bot renews an expiring contract through reviewed commands, not p
   source.meta.bot_managers = ['manager-b'];
   source.init.career.contracts['b-0'].end_date = '2026-08-20';
   const { outDir } = await fixture(t, source);
+  await waitForBotReady(outDir,'manager-b');
   const entries = (await readFile(resolve(outDir, 'journal.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
   const actions = entries.filter(entry => entry.input.op === 'command' && entry.input.actor === 'manager-b');
   assert.ok(actions.some(entry => entry.input.request.command?.Career?.Review));
@@ -128,6 +159,10 @@ test('manager tokens scope commands and observations; public endpoints contain n
   assert.equal((await stat(resolve(outDir, 'auth.json'))).mode & 0o777, 0o600);
   assert.equal((await request('/observe')).code, 401);
   assert.equal((await request('/observe', auth.narrator)).code, 401);
+  for (const path of ['/inbox','/staff-market','/transfer-market']) {
+    assert.equal((await request(path,auth.narrator,path==='/transfer-market'?{}:undefined)).code,401);
+    assert.equal((await request(path,undefined,path==='/transfer-market'?{}:undefined)).code,401);
+  }
   const own = await request('/observe?actor=manager-b', auth.managers['manager-a']);
   assert.equal(own.body.manager_view.club.id, 'a');
   assert.equal(own.body.squad.length, 11);
@@ -154,6 +189,30 @@ test('manager tokens scope commands and observations; public endpoints contain n
   assert.equal((await request('/beat?after=9', auth.narrator)).code, 400);
 });
 
+test('ready manager wakes for its own same-day offer without notifying an unrelated club',async t=>{
+  const source=scenario();
+  source.init.clubs.push({id:'c',name:'Club c',balance:1000});
+  source.init.managers.push({id:'manager-c',club_id:'c'});
+  for(const player of source.init.players.filter(player=>player.club_id==='b')) source.init.players.push({...player,id:player.id.replace('b-','c-'),club_id:'c'});
+  for(const player of source.init.attributes.filter(player=>player.id.startsWith('b-'))) source.init.attributes.push({...structuredClone(player),id:player.id.replace('b-','c-')});
+  source.meta.external_managers.push('manager-c');
+  const {auth,request}=await fixture(t,source);
+  const a=auth.managers['manager-a'],b=auth.managers['manager-b'],c=auth.managers['manager-c'];
+  const observed=(await request('/observe',a)).body;
+  assert.equal(observed.transfer_notice,0);
+  assert.equal((await request('/command',a,{id:'ready',day:1,command:'Ready'})).code,200);
+  const waiting=request('/wait?after=1&after_notice=0',a);
+  const bid={id:'bid',day:1,command:{Offer:{player_id:'a-0',fee:100}}};
+  assert.equal((await request('/command',b,bid)).code,200);
+  const changed=(await waiting).body;
+  assert.equal(changed.observation.day,1);
+  assert.equal(changed.transfer_notice,1);
+  assert.equal(changed.observation.transfer_notice,1);
+  assert.equal((await request('/observe',c)).body.transfer_notice,0);
+  assert.equal((await request('/command',b,bid)).code,200);
+  assert.equal((await request('/observe',a)).body.transfer_notice,1,'Replay must not invent another transfer notification');
+});
+
 test('all-ready advances and releases manager/narrator waits without narration blocking completion', async t => {
   const { auth, request } = await fixture(t);
   const waiting = request('/wait?after=1', auth.managers['manager-a']);
@@ -173,7 +232,7 @@ test('all-ready advances and releases manager/narrator waits without narration b
   assert.ok(Array.isArray(events.results[0].report.goals));
   assert.equal(events.status, 'completed');
   const final = (await request('/public')).body;
-  assert.equal(final.status, 'completed'); assert.ok(final.champions.length >= 1);
+  assert.equal(final.status, 'completed'); assert.deepEqual(final.champions, [final.standings[0].club_id]);
   assert.ok(Array.isArray(final.results[0].report.events));
   const table = (await request('/table')).body;
   assert.deepEqual(table.last_results, events.results);
@@ -187,9 +246,33 @@ test('all-ready advances and releases manager/narrator waits without narration b
   assert.equal((await request('/command', auth.managers['manager-a'], { id: 'late', day: 2, command: 'Ready' })).code, 409);
 });
 
+test('HTTP preparation beat can be narrated before any match while history remains a match cursor', async t => {
+  const source = scenario();
+  source.init.fixtures[0].day = 9;
+  const { auth, request } = await fixture(t, source);
+  for (let day = 1; day <= 7; day++) {
+    const waiting = request(`/wait?after=${day}`, auth.managers['manager-a']);
+    for (const token of Object.values(auth.managers)) {
+      assert.equal((await request('/command', token, { id: `ready-${day}`, day, command: 'Ready' })).code, 200);
+    }
+    await waiting;
+  }
+  const beat = (await request('/beat?after=0', auth.narrator)).body;
+  assert.equal(beat.cursor_kind, 'public_beats');
+  assert.equal(beat.next, 1);
+  assert.equal(beat.beats[0].kind, 'preparation');
+  assert.equal(beat.beats[0].through_day, 7);
+  assert.deepEqual(beat.results, []);
+  assert.equal(beat.status, 'running');
+  assert.equal((await request('/history?after=0')).body.next, 0);
+  assert.equal((await request('/narration', auth.narrator, { after: 0, through: 1,
+    text: 'Days 1–7 have closed; no matches have finished.' })).code, 200);
+});
+
 test('prototype bot readies its club through the same command journal', async t => {
   const source = scenario(); source.meta.external_managers = ['manager-a']; source.meta.bot_managers = ['manager-b'];
   const { auth, request, outDir } = await fixture(t, source);
+  await waitForBotReady(outDir,'manager-b');
   assert.deepEqual(Object.keys(auth.managers), ['manager-a']);
   const beforeIdle = await readFile(resolve(outDir, 'journal.jsonl'), 'utf8');
   await new Promise(resolveWait => setTimeout(resolveWait, 550));

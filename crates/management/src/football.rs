@@ -10,7 +10,7 @@ use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fixture {
     pub id: String,
     pub day: u32,
@@ -353,6 +353,12 @@ pub struct Football {
     pub(crate) recovery: Option<RecoverySetup>,
     pub(crate) started: bool,
     pub(crate) seasons: Option<crate::seasons::SeasonState>,
+    #[serde(default)]
+    pub(crate) competitions: Option<crate::competitions::CompetitionState>,
+    #[serde(default)]
+    pub(crate) statistics: Option<domain::stats::StatsState>,
+    #[serde(default)]
+    pub(crate) national: Option<crate::national::NationalState>,
     pub(crate) boards: Option<BTreeMap<String, BoardRecord>>,
     pub(crate) dismissals: Vec<Dismissal>,
 }
@@ -417,9 +423,30 @@ impl Football {
             recovery: None,
             started: false,
             seasons: None,
+            competitions: None,
+            statistics: None,
+            national: None,
             boards: None,
             dismissals: vec![],
         })
+    }
+
+    /// Trusted host starts a fresh decision window after initialization/simulation
+    /// work. It cannot extend a day in which any participant has submitted work.
+    pub fn open_window(&mut self, day: u32, now_ms: u64, deadline_ms: u64) -> Result<(), String> {
+        if self.management.window.day != day
+            || deadline_ms <= now_ms
+            || self.management.closed
+            || self
+                .management
+                .receipts
+                .values()
+                .any(|(request, _)| request.day == day)
+        {
+            return Err("Only an untouched decision day can be opened".into());
+        }
+        self.management.window.deadline_ms = deadline_ms;
+        Ok(())
     }
 
     pub fn dispatch(
@@ -428,6 +455,24 @@ impl Football {
         request: Request,
         now_ms: u64,
     ) -> Result<Receipt, Error> {
+        if matches!(&request.command, crate::Command::Social(_)) {
+            return self.dispatch_social(actor, request, now_ms);
+        }
+        if matches!(&request.command, crate::Command::Personnel(_)) {
+            return self.dispatch_personnel(actor, request, now_ms);
+        }
+        if matches!(&request.command, crate::Command::Market(_)) {
+            return self.dispatch_market(actor, request, now_ms);
+        }
+        if matches!(&request.command, crate::Command::Economy(_)) {
+            let mut staged = self.clone();
+            let result = staged.management.dispatch(actor, request, now_ms);
+            staged
+                .apply_economy_board_penalties()
+                .map_err(Error::Contract)?;
+            *self = staged;
+            return result;
+        }
         self.management.dispatch(actor, request, now_ms)
     }
 
@@ -507,6 +552,216 @@ impl Football {
         self.management.career_date()
     }
 
+    pub fn configure_training(
+        &mut self,
+        setup: crate::training_commands::TrainingSetup,
+    ) -> Result<(), String> {
+        if self.started || self.management.sequence != 0 || self.management.training.is_some() {
+            return Err(
+                "Training must be configured once before commands or daily processing".into(),
+            );
+        }
+        self.validate_training_setup(&setup)?;
+        self.management.training = Some(setup);
+        Ok(())
+    }
+
+    pub fn configure_match_plans(
+        &mut self,
+        plans: BTreeMap<String, crate::tactics::MatchPlan>,
+    ) -> Result<(), String> {
+        if self.started
+            || self.management.sequence != 0
+            || !self.management.match_plans.is_empty()
+            || plans.keys().ne(self.management.clubs.keys())
+        {
+            return Err("Initial match plans must cover all clubs before commands".into());
+        }
+        self.management.match_plans = plans;
+        Ok(())
+    }
+
+    pub fn configure_lineups(
+        &mut self,
+        lineups: BTreeMap<String, Vec<String>>,
+    ) -> Result<(), String> {
+        if self.started || self.management.sequence != 0 || !self.management.lineups.is_empty() {
+            return Err("Initial lineups can only be configured before commands".into());
+        }
+        for (club, ids) in &lineups {
+            if !self.management.clubs.contains_key(club)
+                || ids.len() > 11
+                || ids.iter().collect::<BTreeSet<_>>().len() != ids.len()
+                || ids.iter().any(|id| {
+                    self.management
+                        .players
+                        .get(id)
+                        .is_none_or(|p| &p.club_id != club)
+                })
+            {
+                return Err("Initial lineup contains duplicate, excess or unowned players".into());
+            }
+        }
+        // A saved source XI may contain injured players. Selection repairs it;
+        // importing must not silently heal them or discard the manager's order.
+        self.management.lineups = lineups;
+        Ok(())
+    }
+
+    pub fn configure_squads(
+        &mut self,
+        profiles: BTreeMap<String, crate::squad_plan::PositionProfile>,
+        plans: BTreeMap<String, crate::squad_plan::SquadPlan>,
+    ) -> Result<(), String> {
+        if self.started
+            || self.management.sequence != 0
+            || self.management.squad_profiles.is_some()
+            || profiles.keys().ne(self.management.players.keys())
+            || plans.keys().ne(self.management.clubs.keys())
+        {
+            return Err("Squad metadata must cover players and clubs once at setup".into());
+        }
+        crate::squad_plan::validate_profiles(&profiles)?;
+        for (club, plan) in &plans {
+            let owned = profiles
+                .iter()
+                .filter(|(id, _)| self.management.players[*id].club_id == *club)
+                .map(|(id, profile)| (id.clone(), profile.clone()))
+                .collect();
+            crate::squad_plan::validate_plan(
+                plan,
+                &owned,
+                self.management
+                    .lineups
+                    .get(club)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            )?;
+        }
+        self.management.squad_profiles = Some(profiles);
+        self.management.squad_plans = plans;
+        Ok(())
+    }
+
+    pub fn squad_plan(&self, actor: &str) -> Result<crate::squad_plan::SquadPlan, Error> {
+        let club = self.manager_view(actor)?.club.id;
+        self.management
+            .squad_profiles
+            .as_ref()
+            .ok_or(Error::Unavailable)?;
+        Ok(self
+            .management
+            .squad_plans
+            .get(&club)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub fn position_profiles(
+        &self,
+        actor: &str,
+    ) -> Result<BTreeMap<String, crate::squad_plan::PositionProfile>, Error> {
+        let club = self.manager_view(actor)?.club.id;
+        let profiles = self
+            .management
+            .squad_profiles
+            .as_ref()
+            .ok_or(Error::Unavailable)?;
+        Ok(profiles
+            .iter()
+            .filter(|(id, _)| self.management.players[*id].club_id == club)
+            .map(|(id, profile)| (id.clone(), profile.clone()))
+            .collect())
+    }
+
+    pub(crate) fn validate_training_setup(
+        &self,
+        setup: &crate::training_commands::TrainingSetup,
+    ) -> Result<(), String> {
+        let date = self
+            .career_date()
+            .ok_or("Full training requires career dates")?;
+        if setup.players.keys().ne(self.management.players.keys())
+            || setup.clubs.keys().ne(self.management.clubs.keys())
+        {
+            return Err("Training metadata must cover every player and club".into());
+        }
+        for (club, plan) in &setup.clubs {
+            let mut group_ids = BTreeSet::new();
+            let mut members = BTreeSet::new();
+            if plan.groups.iter().any(|group| {
+                group.id.trim().is_empty()
+                    || group.name.trim().is_empty()
+                    || !group_ids.insert(&group.id)
+                    || group.player_ids.iter().any(|id| {
+                        !members.insert(id)
+                            || self
+                                .management
+                                .players
+                                .get(id)
+                                .is_none_or(|player| &player.club_id != club)
+                    })
+            }) {
+                return Err("Invalid training group ownership or duplicate membership".into());
+            }
+        }
+        for (id, player) in &self.attributes {
+            let club = &self.management.players[id].club_id;
+            let plan = if club.is_empty() {
+                setup.clubs.values().next().ok_or("No clubs")?
+            } else {
+                &setup.clubs[club]
+            };
+            let morale = self.management.career.as_ref().unwrap().contracts[id].morale;
+            crate::training::validate(player, &setup.players[id], plan, date, morale)?;
+        }
+        Ok(())
+    }
+
+    pub fn configure_availability(
+        &mut self,
+        states: BTreeMap<String, crate::availability::Availability>,
+    ) -> Result<(), String> {
+        if self.started
+            || self.management.sequence != 0
+            || self.management.availability.is_some()
+            || states.keys().ne(self.management.players.keys())
+        {
+            return Err("Availability must cover registered players once at setup".into());
+        }
+        for state in states.values() {
+            state.validate()?;
+        }
+        self.management.availability = Some(states);
+        Ok(())
+    }
+
+    pub fn training_view(
+        &self,
+        actor: &str,
+    ) -> Result<crate::training_commands::TrainingView, Error> {
+        self.management.training_view(actor)
+    }
+
+    pub fn availability_view(
+        &self,
+        actor: &str,
+    ) -> Result<BTreeMap<String, crate::availability::Availability>, Error> {
+        let club = self.manager_view(actor)?.club.id;
+        let states = self
+            .management
+            .availability
+            .as_ref()
+            .ok_or(Error::Unavailable)?;
+        Ok(self
+            .management
+            .players
+            .values()
+            .filter(|player| player.club_id == club || player.club_id.is_empty())
+            .map(|player| (player.id.clone(), states[&player.id].clone()))
+            .collect())
+    }
+
     pub fn configure_boards(
         &mut self,
         profiles: BTreeMap<String, BoardProfile>,
@@ -528,6 +783,9 @@ impl Football {
         let records = profiles
             .into_iter()
             .map(|(id, profile)| {
+                let league_size = self
+                    .club_competition_standings(&self.management.managers[&id].club_id)
+                    .map_or(league_size, |rows| rows.len() as u32);
                 Ok((
                     id.clone(),
                     BoardRecord {
@@ -584,6 +842,9 @@ impl Football {
         let standings = self.standings();
         let mut outcomes = BTreeMap::new();
         for manager in self.management.managers.values() {
+            let standings = self
+                .club_competition_standings(&manager.club_id)
+                .unwrap_or_else(|| standings.clone());
             let (position, standing) = standings
                 .iter()
                 .enumerate()
@@ -642,6 +903,9 @@ impl Football {
             let board = boards
                 .get_mut(&manager.id)
                 .ok_or("Missing active manager board")?;
+            let size = self
+                .club_competition_standings(&manager.club_id)
+                .map_or(size, |rows| rows.len() as u32);
             board.state.reset_objectives(board.reputation, size)?;
         }
         self.boards = Some(boards);
@@ -653,12 +917,34 @@ impl Football {
         day: u32,
         standings: &BTreeMap<String, Standing>,
     ) -> Result<(), String> {
+        let club_tables: BTreeMap<_, _> = self
+            .management
+            .managers
+            .values()
+            .filter_map(|manager| {
+                self.club_competition_standings(&manager.club_id)
+                    .map(|rows| (manager.club_id.clone(), rows))
+            })
+            .collect();
         let Some(boards) = self.boards.as_mut() else {
             return Ok(());
         };
         // Snapshot active identities so a replacement is not checked on its hire day.
         let managers: Vec<_> = self.management.managers.values().cloned().collect();
         for manager in managers {
+            if self
+                .management
+                .team_history
+                .as_ref()
+                .is_some_and(|history| {
+                    history
+                        .vacancies
+                        .values()
+                        .any(|v| v.caretaker_actor == manager.id)
+                })
+            {
+                continue;
+            }
             let record = boards
                 .get_mut(&manager.id)
                 .ok_or("Missing active manager board")?;
@@ -712,6 +998,11 @@ impl Football {
                         replacement_manager_id: replacement_id,
                         standing: standings
                             .get(&manager.club_id)
+                            .or_else(|| {
+                                club_tables.get(&manager.club_id).and_then(|rows| {
+                                    rows.iter().find(|row| row.club_id == manager.club_id)
+                                })
+                            })
                             .ok_or("Missing dismissed club standing")?
                             .clone(),
                     });
@@ -723,6 +1014,9 @@ impl Football {
 
     pub fn recovery_view(&self, actor: &str) -> Result<RecoveryView, Error> {
         let club = self.management.manager_view(actor)?.club;
+        if self.management.training.is_some() {
+            return Err(Error::Unavailable);
+        }
         let setup = self.recovery.as_ref().ok_or(Error::Unavailable)?;
         Ok(RecoveryView {
             mode: self
@@ -804,6 +1098,9 @@ impl Football {
         &self.fixtures
     }
     pub fn standings(&self) -> Vec<Standing> {
+        if let Some(rows) = self.source_primary_standings() {
+            return rows;
+        }
         let mut rows: Vec<_> = self.standings.values().cloned().collect();
         rows.sort_by(|a, b| {
             b.points
@@ -834,27 +1131,66 @@ impl Football {
             .management
             .players
             .values()
-            .filter(|p| p.club_id == club.id)
+            .filter(|p| {
+                p.club_id == club.id
+                    && self
+                        .management
+                        .availability
+                        .as_ref()
+                        .is_none_or(|states| states[&p.id].is_available())
+            })
             .map(|p| data(&p.id))
             .collect();
-        let (players, bench) = crate::selection::select(&available, ids)?;
+        let (players, bench, formation, match_roles) =
+            if let Some(profiles) = &self.management.squad_profiles {
+                let plan = self
+                    .management
+                    .squad_plans
+                    .get(&club.id)
+                    .cloned()
+                    .unwrap_or_default();
+                let selected = crate::squad_plan::select(&available, profiles, ids, &plan)?;
+                (
+                    selected.players,
+                    selected.bench,
+                    plan.formation,
+                    Some(selected.match_roles),
+                )
+            } else {
+                let (players, bench) = crate::selection::select(&available, ids)?;
+                (players, bench, "4-4-2".into(), None)
+            };
         let plan = self
             .management
             .match_plans
             .get(&club.id)
             .cloned()
             .unwrap_or_default();
+        let actor = self
+            .management
+            .managers
+            .values()
+            .find(|manager| manager.club_id == club.id);
+        let manager = actor.and_then(|actor| self.source_manager(&actor.id).ok());
+        let profile = self
+            .management
+            .career
+            .as_ref()
+            .map_or_else(engine::ai::AiProfile::default, |career| {
+                matches::source_profile(career.reputations[&club.id], manager.as_ref())
+            });
         Ok(DelegatedTeam {
+            match_roles,
             team: TeamData {
                 id: club.id.clone(),
                 name: club.name.clone(),
-                formation: "4-4-2".into(),
+                formation,
                 play_style: plan.play_style,
                 tactics: plan.engine_tactics(),
                 players,
             },
             bench,
-            profile: engine::ai::AiProfile::default(),
+            profile,
         })
     }
 
@@ -869,14 +1205,29 @@ impl Football {
         let mut staged = self.clone();
         let results = staged.advance_closed_day_inner(expected_day, now_ms, next_deadline_ms)?;
         staged.apply_weekly_board_pressure()?;
-        let closing_standings = staged.standings.clone();
+        let mut closing_standings = staged.standings.clone();
+        for club in staged.management.clubs.keys() {
+            if let Some(row) = staged
+                .club_competition_standings(club)
+                .and_then(|rows| rows.into_iter().find(|row| &row.club_id == club))
+            {
+                closing_standings.insert(club.clone(), row);
+            }
+        }
         staged.settle_completed_season()?;
         staged.check_boards_on_day(expected_day, &closing_standings)?;
+        if let Some(date) = staged.management.career_date().and_then(|d| d.pred_opt()) {
+            staged.advance_team_history(date)?;
+            staged.capture_news_settlement_events(date)?;
+        }
         *self = staged;
         Ok(results)
     }
 
     fn apply_weekly_board_pressure(&mut self) -> Result<(), String> {
+        if self.management.economy.is_some() {
+            return self.apply_economy_board_penalties();
+        }
         use chrono::Datelike;
         let Some(career) = &self.management.career else {
             return Ok(());
@@ -931,6 +1282,9 @@ impl Football {
         if !self.management.closed(now_ms) {
             return Err("Management window is still open".into());
         }
+        if let Some(today) = self.management.career_date() {
+            self.advance_market_before_matches(today)?;
+        }
         self.started = true;
         let mut staged = vec![];
         let mut staged_attributes = self.attributes.clone();
@@ -939,7 +1293,12 @@ impl Football {
             let away = self.team(&self.management.clubs[&fixture.away])?;
             let home_starting_xi = home.team.players.iter().map(|p| p.id.clone()).collect();
             let away_starting_xi = away.team.players.iter().map(|p| p.id.clone()).collect();
-            let report = matches::play(home, away, fixture.seed)?;
+            let report = matches::play_competition(
+                home,
+                away,
+                fixture.seed,
+                self.competition_fixture_is_knockout(&fixture.id),
+            )?;
             // Stable order and a separate named-purpose stream; match event RNG
             // consumption cannot accidentally decide post-match physical wear.
             let mut rng = rand::rngs::StdRng::seed_from_u64(fixture.seed ^ 0x7068_7973_6963_616c);
@@ -954,6 +1313,19 @@ impl Football {
                     report.player_stats[id].minutes_played,
                     &mut rng,
                 );
+                // Source competitions can schedule a club twice on one date.
+                // Later fixtures select from the physical state left by the
+                // earlier one; the outer staged Football keeps the day atomic.
+                self.attributes.insert(id.clone(), player.clone());
+                if let Some(states) = &mut self.management.availability {
+                    states
+                        .get_mut(id)
+                        .ok_or("Missing player availability")?
+                        .add_match_cards(
+                            report.player_stats[id].yellow_cards,
+                            report.player_stats[id].red_cards,
+                        )?;
+                }
             }
             staged.push(FinishedFixture {
                 fixture_id: fixture.id.clone(),
@@ -965,7 +1337,34 @@ impl Football {
                 away_starting_xi,
             });
         }
-        if staged.is_empty() {
+        if staged.is_empty() && self.management.training.is_some() {
+            let date = self.career_date().ok_or("Training requires career date")?;
+            let setup = self.management.training.as_mut().unwrap();
+            let mut rng = rand::rngs::StdRng::seed_from_u64(
+                setup.seed ^ u64::from(expected_day) ^ 0x7472_6169_6e69_6e67,
+            );
+            for (id, player) in &mut staged_attributes {
+                let club = &self.management.players[id].club_id;
+                if club.is_empty() {
+                    continue;
+                }
+                let morale = self.management.career.as_ref().unwrap().contracts[id].morale;
+                let injured = self
+                    .management
+                    .availability
+                    .as_ref()
+                    .is_some_and(|states| !states[id].is_available());
+                crate::training::train(
+                    player,
+                    setup.players.get_mut(id).unwrap(),
+                    &setup.clubs[club],
+                    date,
+                    morale,
+                    injured,
+                    &mut rng,
+                )?;
+            }
+        } else if staged.is_empty() {
             if let Some(setup) = &self.recovery {
                 let mut rng = rand::rngs::StdRng::seed_from_u64(
                     setup.seed ^ u64::from(expected_day) ^ 0x7265_636f_7665_7279,
@@ -991,16 +1390,84 @@ impl Football {
                 }
             }
         }
-        if let Some(today) = self.management.career_date() {
+        self.attributes = staged_attributes;
+        let closing_date = self.management.career_date();
+        for (index, result) in staged.iter().enumerate() {
+            self.capture_statistics(result)?;
+            self.apply_social_match(result, &staged[..index])?;
+        }
+        if let Some(today) = closing_date {
+            self.advance_dormant_competitions(today)?;
+        }
+        self.prepare_economy_day(&staged)?;
+        if let Some(today) = closing_date {
+            self.deliver_social_training_warnings(today)?;
+            self.advance_national_day(today)?;
             self.management
                 .advance_career(today.succ_opt().ok_or("Career date overflow")?)
                 .map_err(|error| format!("{error:?}"))?;
+            self.advance_social_day(today)?;
+        }
+        let mut new_injuries = Vec::new();
+        if let Some(states) = &mut self.management.availability {
+            for state in states.values_mut() {
+                state.progress_recovery();
+            }
+            if let (Some(training), Some(today)) = (&self.management.training, closing_date) {
+                let date = today.to_string();
+                let mut event_ids: BTreeSet<_> = self
+                    .management
+                    .injury_events
+                    .iter()
+                    .map(|(_, event)| event.id.clone())
+                    .collect();
+                let mut rng = rand::rngs::StdRng::seed_from_u64(
+                    training.seed ^ u64::from(expected_day) ^ 0x696e_6a75_7279_6576,
+                );
+                for club in self.management.clubs.keys() {
+                    let candidates: Vec<_> = self
+                        .management
+                        .players
+                        .values()
+                        .filter(|player| &player.club_id == club)
+                        .map(|player| crate::availability::InjuryCandidate {
+                            player_id: &player.id,
+                            fitness: self.attributes[&player.id].fitness,
+                            availability: &states[&player.id],
+                        })
+                        .collect();
+                    // Today's fixtures have just resolved. Source random events
+                    // check still-scheduled fixtures, not whether a match was played.
+                    if let Some(event) = crate::availability::roll_training_ground_injury(
+                        &candidates,
+                        false,
+                        &date,
+                        &event_ids,
+                        &mut rng,
+                    )? {
+                        states.get_mut(&event.player_id).unwrap().injury =
+                            Some(event.injury.clone());
+                        event_ids.insert(event.id.clone());
+                        new_injuries.push((club.clone(), event.clone()));
+                        self.management.injury_events.push((club.clone(), event));
+                    }
+                }
+            }
+        }
+        if let Some(today) = closing_date {
+            for (club, event) in new_injuries {
+                self.deliver_social_injury(&club, &event, today)?;
+            }
+            self.advance_personnel(today)?;
+            self.advance_market_registrations(today)?;
+            self.advance_news(today)?;
         }
         self.management
             .next_day(expected_day, now_ms, next_deadline_ms)
             .map_err(|e| format!("{e:?}"))?;
-        self.attributes = staged_attributes;
         for result in &staged {
+            let counts = self.primary_competition_contains_fixture(&result.fixture_id);
+            self.complete_competition_fixture(result)?;
             for (id, gf, ga) in [
                 (
                     &result.home,
@@ -1027,7 +1494,13 @@ impl Football {
                             .after_match(gf, ga);
                     }
                 }
-                let row = self.standings.get_mut(id).unwrap();
+                if !counts {
+                    continue;
+                }
+                let row = self
+                    .standings
+                    .get_mut(id)
+                    .ok_or("Primary standing unavailable")?;
                 row.played += 1;
                 row.goals_for += u32::from(gf);
                 row.goals_against += u32::from(ga);
@@ -1043,6 +1516,7 @@ impl Football {
             }
         }
         self.results.extend(staged.iter().cloned());
+        self.refresh_competition_schedule()?;
         Ok(staged)
     }
 }

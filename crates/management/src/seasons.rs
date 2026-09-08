@@ -317,14 +317,35 @@ impl Football {
         self.seasons.as_ref()
     }
 
-    pub fn season_history(&self) -> &[SeasonArchive] {
+    pub fn season_history(&self) -> Vec<&SeasonArchive> {
+        if let Some(s) = &self.competitions {
+            return s.archives.iter().map(|a| &a.summary).collect();
+        }
         self.seasons
             .as_ref()
-            .map(|s| s.archives.as_slice())
-            .unwrap_or(&[])
+            .map(|s| s.archives.iter().collect())
+            .unwrap_or_default()
     }
 
     pub fn public_season_state(&self) -> Option<PublicSeasonState> {
+        if let Some(s) = &self.competitions {
+            return Some(PublicSeasonState {
+                season: s.setup.competitions[&s.setup.primary_competition_id].season,
+                first_day: self
+                    .fixtures
+                    .iter()
+                    .map(|f| f.day)
+                    .min()
+                    .unwrap_or(self.management.window.day),
+                last_day: self
+                    .fixtures
+                    .iter()
+                    .map(|f| f.day)
+                    .max()
+                    .unwrap_or(self.management.window.day),
+                completed_seasons: s.archives.len(),
+            });
+        }
         self.seasons.as_ref().map(|s| PublicSeasonState {
             season: s.setup.season,
             first_day: self
@@ -372,6 +393,14 @@ impl Football {
     /// Atomic and replay-safe: a successful settlement replaces the current
     /// calendar with an unplayed one, so another call cannot pay it twice.
     pub fn settle_completed_season(&mut self) -> Result<Option<SeasonArchive>, String> {
+        if self.competitions.is_some() {
+            let mut staged = self.clone();
+            let result = staged.settle_competition_season()?;
+            if result.is_some() {
+                *self = staged;
+            }
+            return Ok(result);
+        }
         if self.seasons.is_none() {
             return Ok(None);
         }
@@ -535,6 +564,12 @@ impl Football {
             .ok_or("Missing career")?
             .reputations = reputations_after.clone();
         self.update_board_reputations(&reputations_after)?;
+        self.management.settle_economy_season(
+            completed_date,
+            setup.season,
+            setup.season.checked_add(1).ok_or("Season overflow")?,
+            &prizes,
+        )?;
         self.reset_board_objectives()?;
         let archive = SeasonArchive {
             season: setup.season,
@@ -550,6 +585,7 @@ impl Football {
             reputations_after,
             manager_outcomes,
         };
+        self.settle_team_history(setup.season, completed_date, &archive.standings)?;
         self.fixtures = next_fixtures;
         for row in self.standings.values_mut() {
             *row = Standing {
@@ -562,6 +598,12 @@ impl Football {
                 goals_against: 0,
                 points: 0,
             };
+        }
+        self.settle_player_season(setup.season, completed_date)?;
+        if let Some(states) = &mut self.management.availability {
+            for player in states.values_mut() {
+                player.reset_season_cards();
+            }
         }
         let state = self.seasons.as_mut().ok_or("Missing seasons")?;
         state.setup.season = next_season;

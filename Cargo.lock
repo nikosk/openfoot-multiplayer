@@ -45,6 +45,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "domain"
+version = "0.3.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "engine"
 version = "0.3.0"
 dependencies = [
@@ -89,6 +98,7 @@ name = "management"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "domain",
  "engine",
  "rand",
  "serde",

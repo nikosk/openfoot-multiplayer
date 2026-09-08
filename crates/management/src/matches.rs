@@ -11,9 +11,41 @@ use rand::{SeedableRng, rngs::StdRng};
 /// An already selected match-day squad and its delegated manager profile.
 #[derive(Clone, Debug)]
 pub struct DelegatedTeam {
+    pub match_roles: Option<crate::squad_plan::MatchRoles>,
     pub team: TeamData,
     pub bench: Vec<PlayerData>,
     pub profile: engine::ai::AiProfile,
+}
+
+/// Pinned live_match_manager::derive_personality and team-reputation profile.
+pub fn source_profile(
+    reputation: u32,
+    manager: Option<&domain::manager::Manager>,
+) -> engine::ai::AiProfile {
+    use engine::ai::AiPersonality;
+    let personality = if let Some(manager) = manager {
+        let stats = &manager.career_stats;
+        if reputation >= 700 && stats.matches_managed >= 50 {
+            AiPersonality::Visionary
+        } else if stats.matches_managed >= 20
+            && f64::from(stats.wins) / f64::from(stats.matches_managed) >= 0.55
+        {
+            AiPersonality::Reactive
+        } else if reputation >= 800 {
+            AiPersonality::Visionary
+        } else {
+            AiPersonality::Pragmatist
+        }
+    } else if reputation >= 800 {
+        AiPersonality::Visionary
+    } else {
+        AiPersonality::Pragmatist
+    };
+    engine::ai::AiProfile {
+        reputation,
+        experience: (reputation / 10).min(100) as u8,
+        personality,
+    }
 }
 
 /// Play one regulation-time fixture, including stoppage time, without extra time.
@@ -22,6 +54,16 @@ pub struct DelegatedTeam {
 /// it is not a promise of stability across dependency upgrades. AI command order
 /// is explicitly home then away after each engine step, as in the upstream tests.
 pub fn play(home: DelegatedTeam, away: DelegatedTeam, seed: u64) -> Result<MatchReport, String> {
+    play_competition(home, away, seed, false)
+}
+
+/// Knockout fixtures use the same engine's extra time and penalty shootout.
+pub fn play_competition(
+    home: DelegatedTeam,
+    away: DelegatedTeam,
+    seed: u64,
+    knockout: bool,
+) -> Result<MatchReport, String> {
     let mut ids = HashSet::new();
     validate(&home, &mut ids)?;
     validate(&away, &mut ids)?;
@@ -32,8 +74,14 @@ pub fn play(home: DelegatedTeam, away: DelegatedTeam, seed: u64) -> Result<Match
         MatchConfig::default(),
         home.bench,
         away.bench,
-        false,
+        knockout,
     );
+    if let Some(roles) = &home.match_roles {
+        roles.apply(&mut state, Side::Home)?;
+    }
+    if let Some(roles) = &away.match_roles {
+        roles.apply(&mut state, Side::Away)?;
+    }
     for _ in 0..500 {
         state.step_minute(&mut rng);
         for (side, profile) in [(Side::Home, &home.profile), (Side::Away, &away.profile)] {
@@ -54,7 +102,7 @@ fn validate(squad: &DelegatedTeam, ids: &mut HashSet<String>) -> Result<(), Stri
     if squad.team.players.len() != 11 {
         return Err("a starting lineup must contain exactly 11 players".into());
     }
-    if squad.bench.len() > 12 {
+    if squad.bench.len() > 12 && squad.match_roles.is_none() {
         return Err("a match-day bench must contain at most 12 players".into());
     }
     if squad.team.id.trim().is_empty() || !ids.insert(squad.team.id.clone()) {
@@ -146,6 +194,7 @@ mod tests {
             _ => Position::Forward,
         };
         DelegatedTeam {
+            match_roles: None,
             team: TeamData {
                 id: id.into(),
                 name: id.into(),

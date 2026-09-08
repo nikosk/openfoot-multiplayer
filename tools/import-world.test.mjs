@@ -3,16 +3,58 @@ import assert from 'node:assert/strict';
 import { buildScenario } from './import-world.mjs';
 
 function bundle(count = 2) {
-  const teams = Array.from({ length: count }, (_, i) => ({ id: `team-${i}`, name: `Team ${i}`, finance: 5000, reputation: 700, wage_budget: 50000, facilities: { medical: 3 } }));
+  const teams = Array.from({ length: count }, (_, i) => ({ id: `team-${i}`, name: `Team ${i}`, finance: 5000, reputation: 700, wage_budget: 50000, facilities: { medical: 3, training: 1, scouting: 1 }, training_focus: 'Physical', training_intensity: 'Medium', training_schedule: 'Balanced', training_groups: [], formation: '4-4-2' }));
   const attributes = Object.fromEntries('pace stamina strength agility passing shooting tackling dribbling defending positioning vision decisions composure aggression teamwork leadership handling reflexes aerial'.split(' ').map((key, i) => [key, 50 + i]));
+  for (const team of teams) Object.assign(team, {transfer_budget:1000,season_income:0,season_expenses:0,stadium_capacity:10000});
   return { manifest: { compatibility: { snapshot_date: '2026-09-08' } }, teams,
-    players: teams.flatMap(team => Array.from({ length: 12 }, (_, i) => ({ id: `${team.id}-p${i}`, team_id: team.id, match_name: `Player ${i}`, date_of_birth: '2000-09-09', position: 'Midfielder', attributes: { ...attributes }, ovr: 65, condition: 80, fitness: 70, morale: 60, traits: ['Leader'], injury: null, retired: false, wage: 1040, contract_end: '2028-06-30', market_value: 200000, morale_core: { manager_trust: 50, renewal_state: null } }))),
-    staff: [{ id: 'physio', team_id: 'team-0', wage: 520, role: 'Physio', attributes: { physiotherapy: 75 } }, { id: 'coach', team_id: 'team-0', wage: 1040, role: 'Coach', attributes: { physiotherapy: 99 } }],
+    players: teams.flatMap(team => Array.from({ length: 12 }, (_, i) => ({ id: `${team.id}-p${i}`, team_id: team.id, match_name: `Player ${i}`, date_of_birth: '2000-09-09', position: 'Midfielder', footedness: 'Right', weak_foot: 3, potential: 80, attributes: { ...attributes }, ovr: 65, condition: 80, fitness: 70, morale: 60, traits: ['Leader'], injury: null, retired: false, wage: 1040, contract_end: '2028-06-30', market_value: 200000, morale_core: { manager_trust: 50, renewal_state: null } }))),
+    staff: [{ id: 'physio', team_id: 'team-0', wage: 520, role: 'Physio', attributes: { physiotherapy: 75 } }, { id: 'coach', team_id: 'team-0', wage: 1040, role: 'Coach', attributes: { physiotherapy: 99, coaching: 70 } }],
     competitions: [{ id: 'league', kind: 'League', season: 2026, season_start_month: 8, season_start_day: 1, participant_ids: teams.map(team => team.id) }],
     source: { manifest: { path: '/immutable/world.json', sha256: 'example' } },
   };
 }
 const options = { competition: 'league', source_team: 'team-0', replace_team: 'team-1', division_tier: 0 };
+
+test('world scope retains foreign clubs, free market, original calendar and rich manager clones',()=>{
+  const input=bundle(4);
+  input.competitions[0].participant_ids=['team-0','team-1'];
+  input.competitions[0].fixtures=[{id:'original-fixture',home_team_id:'team-0',away_team_id:'team-1',date:'2026-09-09'}];
+  input.competitions.push({...structuredClone(input.competitions[0]),id:'foreign',participant_ids:['team-2','team-3'],fixtures:[]});
+  input.manifest.regions=[{id:'europe',countryCodes:['ENG']}];
+  input.manifest.defaultActiveCompetitions=['league'];
+  input.managers=input.teams.map(team=>({id:`rich-${team.id}`,team_id:team.id,last_name:'Manager',satisfaction:65,career_history:[]}));
+  for(const team of input.teams) Object.assign(team,{football_nation:'ENG',manager_id:`rich-${team.id}`,play_style:'Attacking',tactics_phase:{tempo:'Patient'}});
+  input.players.push({...structuredClone(input.players[0]),id:'free',team_id:null,wage:0,contract_end:null});
+  input.nationalTeams=[];input.worldHistory={rivalries:[]};input.news=[];
+  input.worldHistory.season_awards=[
+    {season:2025,golden_boot:{player_id:input.players[0].id,team_id:'team-0',player_name:'Original A',team_name:'Team 0',value:21}},
+    {season:2024,golden_boot:{player_id:input.players[12].id,team_id:'team-1',player_name:'Original B',team_name:'Team 1',value:19}},
+  ];
+  input.stats={player_matches:[{player_id:input.players[0].id,team_id:'team-0'}],team_matches:[{team_id:'team-1'}]};
+  const before=structuredClone(input);
+  const {init}=buildScenario(input,{...options,scope:'world'});
+  assert.deepEqual(input,before);
+  assert.equal(init.clubs.length,4);
+  assert.equal(init.players.find(p=>p.id==='free').club_id,'');
+  assert.equal(init.seasons,undefined);
+  assert.deepEqual(init.national.world_history,input.worldHistory);
+  assert.deepEqual(init.statistics,input.stats);
+  for (const award of init.national.world_history.season_awards) {
+    const winner=award.golden_boot;
+    assert.ok(init.team_history.archived_identities.players[winner.player_id]);
+    assert.ok(init.team_history.archived_identities.teams[winner.team_id]);
+    assert.ok(!init.players.some(player=>player.id===winner.player_id));
+    assert.ok(!init.career.contracts[winner.player_id]);
+  }
+  assert.deepEqual(Object.keys(init.team_history.archived_identities.managers).sort(),['rich-team-0','rich-team-1']);
+  assert.deepEqual(init.competitions.active_competition_ids,['league']);
+  assert.deepEqual(init.competitions.competitions.foreign,input.competitions[1]);
+  assert.deepEqual(init.competitions.competitions.league.fixtures,[{id:'original-fixture',home_team_id:'clone-a',away_team_id:'clone-b',date:'2026-09-09'}]);
+  assert.deepEqual(init.match_plans['clone-a'],init.match_plans['clone-b']);
+  assert.equal(init.team_history.managers['clone-a:rich-team-0'].satisfaction,65);
+  assert.equal(init.team_history.managers['clone-b:rich-team-0'].satisfaction,65);
+  assert.notEqual(init.team_history.actor_manager_ids['manager:clone-a'],init.team_history.actor_manager_ids['manager:clone-b']);
+});
 
 test('independent equal clones preserve original input and explicit provenance', () => {
   const input = bundle();
@@ -35,6 +77,8 @@ test('independent equal clones preserve original input and explicit provenance',
     assert.notEqual(a.traits, b.traits);
     assert.deepEqual(result.init.recovery.players[aid], { age: 25, morale: 60 });
     assert.deepEqual(result.init.career.contracts[aid], result.init.career.contracts[bid]);
+    assert.deepEqual(result.init.training.players[aid], result.init.training.players[bid]);
+    assert.deepEqual(result.init.squads.profiles[aid], result.init.squads.profiles[bid]);
   }
   assert.deepEqual(result.init.recovery.clubs['clone-a'], { medical_level: 3, physiotherapy: [75] });
   result.init.attributes[0].traits.push('changed');
@@ -42,6 +86,19 @@ test('independent equal clones preserve original input and explicit provenance',
   assert.deepEqual(result.init.attributes[12].traits, ['Leader']);
   assert.deepEqual(result.init.recovery.clubs['clone-b'].physiotherapy, [75]);
   assert.deepEqual(input, original);
+});
+
+test('injuries, granular positions and cloned training-group references are retained', () => {
+  const input = bundle();
+  input.players[0].injury = { name: 'strain', days_remaining: 8 };
+  input.players[0].natural_position = 'LeftBack';
+  input.players[0].position = 'LeftBack';
+  input.teams[0].training_groups = [{ id: 'group', name: 'Defence', focus: 'Defending', player_ids: ['team-0-p0'] }];
+  const { init } = buildScenario(input, options);
+  assert.deepEqual(init.availability['clone-a:team-0-p0'].injury, { name: 'strain', days_remaining: 8 });
+  assert.equal(init.attributes[0].position, 'Defender');
+  assert.equal(init.squads.profiles['clone-b:team-0-p0'].natural_position, 'LeftBack');
+  assert.deepEqual(init.training.clubs['clone-b'].groups[0].player_ids, ['clone-b:team-0-p0']);
 });
 
 test('retains all other league clubs and bot identities', () => {
@@ -64,7 +121,7 @@ test('rejects invalid league membership and unsupported or missing source data',
     b => { delete b.teams[0].wage_budget; },
     b => { b.players[0].contract_end = '2027-02-30'; },
     b => { b.players[0].morale_core.renewal_state = {}; },
-    b => { b.teams[0].facilities.medical = 0; },
+    b => { b.teams[0].facilities.medical = 256; },
     b => { b.players[0].date_of_birth = '2000-02-30'; },
     b => { b.players[0].date_of_birth = '1800-01-01'; },
     b => { b.competitions[0].kind = 'Cup'; },
