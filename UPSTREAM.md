@@ -16,3 +16,16 @@ upstream notices when extending imported files. The full GPLv3 text is in LICENS
 The engine's original dependencies are retained. The root Cargo.lock records the
 resolved dependency versions for this standalone workspace, not a claim of full
 application reproducibility or equivalence to a previously compiled game binary.
+
+## Adapted management helpers
+
+`crates/management/src/physical.rs` adapts `ofm_core/src/player_wear.rs` from the
+same revision to engine player records. The wear/sharpness formulas are preserved;
+club injury rolls are not added. Physical-effects RNG stream selection and
+persistence orchestration are new and not claimed equivalent to upstream runs.
+
+`crates/management/src/selection.rs` derives a grouped-position fallback from
+`ofm_core/src/live_match_manager/team_builder.rs`. It preserves all available
+preferred starters rather than applying the original low-survivor rebuild rule,
+and uses stable ID tie-breaking. Detailed formation-slot mapping is not ported.
+Both files retain GPLv3-or-later upstream attribution and document deviations.

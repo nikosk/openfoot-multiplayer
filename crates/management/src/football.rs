@@ -5,6 +5,7 @@ use crate::{
     matches::{self, DelegatedTeam},
 };
 use engine::{PlayerData, TeamData};
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -23,6 +24,8 @@ pub struct FinishedFixture {
     pub day: u32,
     pub home: String,
     pub away: String,
+    pub home_starting_xi: Vec<String>,
+    pub away_starting_xi: Vec<String>,
     pub report: engine::MatchReport,
 }
 
@@ -164,33 +167,21 @@ impl Football {
             .management
             .lineups
             .get(&club.id)
-            .ok_or("No starting XI selected")?;
-        if ids.len() != 11
-            || ids.iter().any(|id| {
-                self.management
-                    .players
-                    .get(id)
-                    .is_none_or(|p| p.club_id != club.id)
-            })
-        {
-            return Err("Starting XI no longer belongs to club".into());
-        }
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let data = |id: &String| {
             let mut player = self.attributes[id].clone();
             player.name = self.management.players[id].name.clone();
             player
         };
-        let players = ids.iter().map(data).collect();
-        // Explicit prototype policy: registry-ID order, at most twelve substitutes.
-        // Position/reputation-aware selection and eligibility belong to later parity work.
-        let bench = self
+        let available: Vec<_> = self
             .management
             .players
             .values()
-            .filter(|p| p.club_id == club.id && !ids.contains(&p.id))
-            .take(12)
+            .filter(|p| p.club_id == club.id)
             .map(|p| data(&p.id))
             .collect();
+        let (players, bench) = crate::selection::select(&available, ids)?;
         Ok(DelegatedTeam {
             team: TeamData {
                 id: club.id.clone(),
@@ -223,21 +214,42 @@ impl Football {
             return Err("Management window is still open".into());
         }
         let mut staged = vec![];
+        let mut staged_attributes = self.attributes.clone();
         for fixture in self.fixtures.iter().filter(|f| f.day == expected_day) {
             let home = self.team(&self.management.clubs[&fixture.home])?;
             let away = self.team(&self.management.clubs[&fixture.away])?;
+            let home_starting_xi = home.team.players.iter().map(|p| p.id.clone()).collect();
+            let away_starting_xi = away.team.players.iter().map(|p| p.id.clone()).collect();
             let report = matches::play(home, away, fixture.seed)?;
+            // Stable order and a separate named-purpose stream; match event RNG
+            // consumption cannot accidentally decide post-match physical wear.
+            let mut rng = rand::rngs::StdRng::seed_from_u64(fixture.seed ^ 0x7068_7973_6963_616c);
+            let mut ids: Vec<_> = report.player_stats.keys().collect();
+            ids.sort();
+            for id in ids {
+                let player = staged_attributes
+                    .get_mut(id)
+                    .ok_or("Unknown report player")?;
+                crate::physical::apply_match_wear(
+                    player,
+                    report.player_stats[id].minutes_played,
+                    &mut rng,
+                );
+            }
             staged.push(FinishedFixture {
                 fixture_id: fixture.id.clone(),
                 day: expected_day,
                 home: fixture.home.clone(),
                 away: fixture.away.clone(),
                 report,
+                home_starting_xi,
+                away_starting_xi,
             });
         }
         self.management
             .next_day(expected_day, now_ms, next_deadline_ms)
             .map_err(|e| format!("{e:?}"))?;
+        self.attributes = staged_attributes;
         for result in &staged {
             for (id, gf, ga) in [
                 (

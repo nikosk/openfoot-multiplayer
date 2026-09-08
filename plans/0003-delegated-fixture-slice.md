@@ -3,6 +3,10 @@
 Status: implemented prototype slice. This connects existing transaction state to
 the imported engine, not a complete season/economy implementation.
 
+Follow-up: [plan 0004](0004-squad-repair-and-wear.md) supersedes this slice's missing-XI
+failure and nonpersistent-wear limitations. The historical notes below describe
+the original slice; fewer than11 eligible players still needs roster-safety work.
+
 - Add manager-owned starting-XI commands using the same authorization, readiness,
   day and idempotency boundary as transfers.
 - Store engine player attributes by immutable player ID. Club ownership remains

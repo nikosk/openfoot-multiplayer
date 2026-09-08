@@ -28,8 +28,10 @@ It is not a network server, full transfer/contract system, save format or playab
 league yet. The host must authenticate clients; client-selected actor IDs are not
 authentication. Explicit fixtures now resolve at closed daily windows. Full daily
 football consequences, contracts, calendar generation and native manager bots are
-still pending. Invalidated lineups currently fail day resolution rather than
-automatically selecting replacements; this must be resolved before autonomous play.
+still pending. Missing/departed selections now receive deterministic lineup repair,
+and played minutes carry condition/fitness effects into the next day. Fewer than
+eleven available players still prevents resolution; injury persistence, training
+recovery and emergency roster rules must be completed before autonomous careers.
 
 ## License and attribution
 

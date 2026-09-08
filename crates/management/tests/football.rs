@@ -54,7 +54,7 @@ fn later_fixture_failure_does_not_publish_earlier_staged_result() {
     let ids = ["a", "b", "c", "d"];
     let data: Vec<_> = ids
         .iter()
-        .flat_map(|club| (0..11).map(move |i| attributes(club, i)))
+        .flat_map(|club| (0..if *club == "d" { 10 } else { 11 }).map(move |i| attributes(club, i)))
         .collect();
     let clubs = ids
         .iter()
@@ -108,16 +108,25 @@ fn later_fixture_failure_does_not_publish_earlier_staged_result() {
         .unwrap();
     }
     let before = game.standings();
+    let physical_before = serde_json::to_value(game.squad("a").unwrap()).unwrap();
     assert!(game.advance_closed_day(1, 1000, 2000).is_err());
     assert!(game.results().is_empty());
     assert_eq!(game.standings(), before);
     assert_eq!(game.public_state().day, 1);
+    assert_eq!(
+        serde_json::to_value(game.squad("a").unwrap()).unwrap(),
+        physical_before
+    );
 }
 
 fn management() -> (Management, Vec<PlayerData>) {
+    management_with_size(11)
+}
+
+fn management_with_size(size: usize) -> (Management, Vec<PlayerData>) {
     let attributes: Vec<_> = ["a", "b"]
         .into_iter()
-        .flat_map(|club| (0..11).map(move |i| attributes(club, i)))
+        .flat_map(|club| (0..size).map(move |i| attributes(club, i)))
         .collect();
     let clubs = ["a", "b"]
         .map(|id| Club {
@@ -144,6 +153,136 @@ fn management() -> (Management, Vec<PlayerData>) {
         Management::new(clubs, players, managers, 1, 1000).unwrap(),
         attributes,
     )
+}
+
+#[test]
+fn missing_selection_is_repaired_and_match_wear_persists() {
+    let (management, attributes) = management_with_size(18);
+    let mut game = Football::new(
+        management,
+        attributes,
+        vec![Fixture {
+            id: "fixture".into(),
+            day: 1,
+            home: "a".into(),
+            away: "b".into(),
+            seed: 1001,
+        }],
+    )
+    .unwrap();
+    let results = game.advance_closed_day(1, 1000, 2000).unwrap();
+    assert_eq!(results[0].home_starting_xi.len(), 11);
+    assert_eq!(results[0].away_starting_xi.len(), 11);
+    let report = &results[0].report;
+    let mut played = 0;
+    let mut unused = 0;
+    for club in ["a", "b"] {
+        for player in game.squad(club).unwrap() {
+            let minutes = report
+                .player_stats
+                .get(&player.id)
+                .map_or(0, |s| s.minutes_played);
+            let depletion = (40.0 * (1.0 - 0.65 * 0.4) * f64::from(minutes) / 90.0) as u8;
+            assert_eq!(player.condition, 100u8.saturating_sub(depletion));
+            assert!(player.fitness >= 75);
+            if minutes == 0 {
+                unused += 1;
+                assert_eq!(player.fitness, 75);
+            } else {
+                played += 1;
+            }
+        }
+    }
+    assert!(played >= 22);
+    assert!(unused > 0);
+    let after = serde_json::to_value(game.squad("a").unwrap()).unwrap();
+    assert!(game.advance_closed_day(1, 1000, 2000).is_err());
+    assert_eq!(
+        serde_json::to_value(game.squad("a").unwrap()).unwrap(),
+        after
+    );
+}
+
+#[test]
+fn transfer_repairs_departed_starter_from_reserves_without_overriding_others() {
+    let (management, attributes) = management_with_size(12);
+    let mut game = Football::new(
+        management,
+        attributes,
+        vec![Fixture {
+            id: "fixture".into(),
+            day: 1,
+            home: "a".into(),
+            away: "b".into(),
+            seed: 1001,
+        }],
+    )
+    .unwrap();
+    let preferred: Vec<_> = (0..11).map(|i| format!("b-{i}")).collect();
+    game.dispatch(
+        "b",
+        request(
+            "lineup",
+            1,
+            Command::SetLineup {
+                player_ids: preferred.clone(),
+            },
+        ),
+        10,
+    )
+    .unwrap()
+    .result
+    .unwrap();
+    let Outcome::Offered(offer) = game
+        .dispatch(
+            "a",
+            request(
+                "bid",
+                1,
+                Command::Offer {
+                    player_id: "b-10".into(),
+                    fee: 100,
+                },
+            ),
+            20,
+        )
+        .unwrap()
+        .result
+        .unwrap()
+    else {
+        panic!()
+    };
+    let Outcome::Preview(preview) = game
+        .dispatch(
+            "b",
+            request("review", 1, Command::Review { offer_id: offer.id }),
+            30,
+        )
+        .unwrap()
+        .result
+        .unwrap()
+    else {
+        panic!()
+    };
+    game.dispatch(
+        "b",
+        request(
+            "confirm",
+            1,
+            Command::Confirm {
+                preview_id: preview.id,
+            },
+        ),
+        40,
+    )
+    .unwrap()
+    .result
+    .unwrap();
+    let results = game.advance_closed_day(1, 1000, 2000).unwrap();
+    let actual = &results[0].away_starting_xi;
+    assert_eq!(&actual[..10], &preferred[..10]);
+    assert_eq!(actual[10], "b-11");
+    assert!(!actual.contains(&"b-10".to_string()));
 }
 
 fn setup() -> Football {
@@ -337,7 +476,7 @@ fn transferred_player_changes_squads_and_invalidates_old_lineup_without_advancin
     assert!(
         game.advance_closed_day(1, 1000, 2000)
             .unwrap_err()
-            .contains("Starting XI")
+            .contains("at least 11 eligible players")
     );
     assert_eq!(game.public_state().day, 1);
     assert!(game.results().is_empty());

@@ -2,6 +2,8 @@
 //! trusted time; neither belongs in an untrusted client command payload.
 pub mod football;
 pub mod matches;
+pub mod physical;
+pub mod selection;
 pub mod window;
 
 use serde::{Deserialize, Serialize};
