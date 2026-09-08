@@ -127,6 +127,29 @@ fn main() {
         .result
         .unwrap();
     }
+    // Different private pre-match plans, submitted through the same command path.
+    for (club, play_style) in [
+        ("north", engine::PlayStyle::Possession),
+        ("south", engine::PlayStyle::Counter),
+    ] {
+        game.dispatch(
+            &format!("manager-{club}"),
+            Request {
+                id: "match-plan".into(),
+                day: 1,
+                command: Command::SetMatchPlan {
+                    plan: management::tactics::MatchPlan {
+                        play_style,
+                        ..Default::default()
+                    },
+                },
+            },
+            200,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+    }
     // Deadlines close both days even though the scripted managers never say ready.
     for day in 1..=2 {
         let results = game

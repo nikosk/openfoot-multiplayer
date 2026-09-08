@@ -5,6 +5,7 @@ pub mod matches;
 pub mod physical;
 pub mod recovery;
 pub mod selection;
+pub mod tactics;
 pub mod window;
 
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,7 @@ pub struct Manager {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
+    SetMatchPlan { plan: tactics::MatchPlan },
     SetRecovery { mode: recovery::RecoveryMode },
     SetLineup { player_ids: Vec<String> },
     Offer { player_id: String, fee: u64 },
@@ -92,6 +94,7 @@ pub struct Preview {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
+    MatchPlanSet,
     RecoverySet,
     LineupSet,
     Offered(Offer),
@@ -161,6 +164,7 @@ pub struct Management {
     lineups: BTreeMap<String, Vec<String>>,
     recovery_modes: BTreeMap<String, recovery::RecoveryMode>,
     recovery_enabled: bool,
+    match_plans: BTreeMap<String, tactics::MatchPlan>,
 }
 
 impl Management {
@@ -205,6 +209,7 @@ impl Management {
             lineups: BTreeMap::new(),
             recovery_modes: BTreeMap::new(),
             recovery_enabled: false,
+            match_plans: BTreeMap::new(),
         })
     }
 
@@ -387,6 +392,13 @@ impl Management {
     fn execute(&mut self, actor: &str, command: &Command) -> Result<Outcome, Error> {
         let club = self.managers[actor].club_id.clone();
         match command {
+            Command::SetMatchPlan { plan } => {
+                if self.window.is_ready(actor) {
+                    return Err(Error::AlreadyReady);
+                }
+                self.match_plans.insert(club, plan.clone());
+                Ok(Outcome::MatchPlanSet)
+            }
             Command::SetRecovery { mode } => {
                 if !self.recovery_enabled {
                     return Err(Error::Unavailable);

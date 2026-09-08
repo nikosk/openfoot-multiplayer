@@ -222,6 +222,18 @@ impl Football {
     pub fn public_state(&self) -> PublicState {
         self.management.public_state()
     }
+
+    /// Saved pre-match instructions, private to the authenticated club manager.
+    /// Automatic in-match adjustments never write back to this plan.
+    pub fn match_plan(&self, actor: &str) -> Result<crate::tactics::MatchPlan, Error> {
+        let club = self.management.manager_view(actor)?.club;
+        Ok(self
+            .management
+            .match_plans
+            .get(&club.id)
+            .cloned()
+            .unwrap_or_default())
+    }
     pub fn results(&self) -> &[FinishedFixture] {
         &self.results
     }
@@ -260,13 +272,19 @@ impl Football {
             .map(|p| data(&p.id))
             .collect();
         let (players, bench) = crate::selection::select(&available, ids)?;
+        let plan = self
+            .management
+            .match_plans
+            .get(&club.id)
+            .cloned()
+            .unwrap_or_default();
         Ok(DelegatedTeam {
             team: TeamData {
                 id: club.id.clone(),
                 name: club.name.clone(),
                 formation: "4-4-2".into(),
-                play_style: engine::PlayStyle::Balanced,
-                tactics: engine::TacticsConfig::default(),
+                play_style: plan.play_style,
+                tactics: plan.engine_tactics(),
                 players,
             },
             bench,

@@ -634,3 +634,283 @@ fn next_day_preserves_offers_but_clears_previews_and_readiness() {
     assert_eq!(game.next_day(1, 80, 2000), Err(Error::WrongDay));
     assert_eq!(game.public_state().day, 2);
 }
+
+#[test]
+fn match_plans_are_private_scoped_persistent_and_follow_request_rules() {
+    use management::tactics::MatchPlan;
+
+    let mut game = setup();
+    let default = MatchPlan::default();
+    let attacking = MatchPlan {
+        play_style: engine::PlayStyle::Attacking,
+        pressing_intensity: engine::PressingIntensity::Aggressive,
+        ..default.clone()
+    };
+    assert_eq!(game.match_plan("outsider"), Err(Error::Unauthorized));
+    assert_eq!(game.match_plan("a").unwrap(), default);
+    assert_eq!(game.match_plan("b").unwrap(), default);
+    let public_before = serde_json::to_value(game.public_state()).unwrap();
+    let opponent_before = serde_json::to_value(game.manager_view("b").unwrap()).unwrap();
+    let change = request(
+        "plan",
+        1,
+        Command::SetMatchPlan {
+            plan: attacking.clone(),
+        },
+    );
+    assert_eq!(
+        game.dispatch("outsider", change.clone(), 20),
+        Err(Error::Unauthorized)
+    );
+    let receipt = game.dispatch("a", change.clone(), 20).unwrap();
+    assert_eq!(receipt.result, Ok(Outcome::MatchPlanSet));
+    assert_eq!(game.match_plan("a").unwrap(), attacking);
+    assert_eq!(game.match_plan("b").unwrap(), default);
+    assert_eq!(
+        serde_json::to_value(game.public_state()).unwrap(),
+        public_before
+    );
+    assert_eq!(
+        serde_json::to_value(game.manager_view("b").unwrap()).unwrap(),
+        opponent_before
+    );
+    assert_eq!(game.dispatch("a", change.clone(), 21).unwrap(), receipt);
+    assert_eq!(
+        game.dispatch(
+            "a",
+            request(
+                "plan",
+                1,
+                Command::SetMatchPlan {
+                    plan: default.clone()
+                }
+            ),
+            22
+        ),
+        Err(Error::RequestIdReused)
+    );
+    game.dispatch("a", request("ready", 1, Command::Ready), 30)
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(
+        game.dispatch(
+            "a",
+            request(
+                "after-ready",
+                1,
+                Command::SetMatchPlan {
+                    plan: default.clone()
+                }
+            ),
+            40
+        )
+        .unwrap()
+        .result,
+        Err(Error::AlreadyReady)
+    );
+    assert_eq!(
+        game.dispatch(
+            "b",
+            request(
+                "after-deadline",
+                1,
+                Command::SetMatchPlan {
+                    plan: attacking.clone()
+                }
+            ),
+            1000
+        )
+        .unwrap()
+        .result,
+        Err(Error::DayClosed)
+    );
+    assert_eq!(game.dispatch("a", change.clone(), 1000).unwrap(), receipt);
+    game.advance_closed_day(1, 1000, 2000).unwrap();
+    assert_eq!(game.match_plan("a").unwrap(), attacking);
+    assert_eq!(game.match_plan("b").unwrap(), default);
+    assert_eq!(game.dispatch("a", change, 1001).unwrap(), receipt);
+    assert_eq!(
+        game.dispatch(
+            "a",
+            request(
+                "old-day",
+                1,
+                Command::SetMatchPlan {
+                    plan: default.clone()
+                }
+            ),
+            1001
+        )
+        .unwrap()
+        .result,
+        Err(Error::WrongDay)
+    );
+    assert_eq!(
+        game.dispatch(
+            "a",
+            request(
+                "new-day",
+                2,
+                Command::SetMatchPlan {
+                    plan: default.clone()
+                }
+            ),
+            1001
+        )
+        .unwrap()
+        .result,
+        Ok(Outcome::MatchPlanSet)
+    );
+    assert_eq!(game.match_plan("a").unwrap(), default);
+}
+
+#[test]
+fn both_saved_match_plans_seed_the_delegated_engine() {
+    use management::{
+        matches::{self, DelegatedTeam},
+        tactics::MatchPlan,
+    };
+
+    let home_plan = MatchPlan {
+        play_style: engine::PlayStyle::HighPress,
+        pressing_intensity: engine::PressingIntensity::Aggressive,
+        defensive_line: engine::DefensiveLine::High,
+        width: engine::TacticsPitchWidth::Wide,
+        build_up_style: engine::TacticsBuildUpStyle::Short,
+        marking_style: engine::MarkingStyle::ManToMan,
+        tempo: engine::Tempo::Patient,
+        defensive_shape: engine::DefensiveShape::Compact,
+        counter_press_duration: engine::CounterPressDuration::Long,
+        break_speed: engine::BreakSpeed::Fast,
+    };
+    let away_plan = MatchPlan {
+        play_style: engine::PlayStyle::Counter,
+        pressing_intensity: engine::PressingIntensity::Passive,
+        defensive_line: engine::DefensiveLine::VeryLow,
+        width: engine::TacticsPitchWidth::Narrow,
+        build_up_style: engine::TacticsBuildUpStyle::Long,
+        marking_style: engine::MarkingStyle::Mixed,
+        tempo: engine::Tempo::Patient,
+        defensive_shape: engine::DefensiveShape::Stretched,
+        counter_press_duration: engine::CounterPressDuration::Short,
+        break_speed: engine::BreakSpeed::Slow,
+    };
+    let mut game = setup();
+    for (actor, plan) in [("a", &home_plan), ("b", &away_plan)] {
+        game.dispatch(
+            actor,
+            request("plan", 1, Command::SetMatchPlan { plan: plan.clone() }),
+            20,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+    }
+    let team = |club: &str, plan: &MatchPlan| {
+        let available: Vec<_> = (0..11).map(|i| attributes(club, i)).collect();
+        let (players, bench) =
+            management::selection::select(&available, &game.lineup(club).unwrap()).unwrap();
+        DelegatedTeam {
+            team: engine::TeamData {
+                id: club.into(),
+                name: club.into(),
+                formation: "4-4-2".into(),
+                play_style: plan.play_style,
+                tactics: plan.engine_tactics(),
+                players,
+            },
+            bench,
+            profile: engine::ai::AiProfile::default(),
+        }
+    };
+    let expected = serde_json::to_value(
+        matches::play(team("a", &home_plan), team("b", &away_plan), 1001).unwrap(),
+    )
+    .unwrap();
+    // Each side independently matters; this catches dropping either saved plan.
+    for (home, away) in [
+        (&MatchPlan::default(), &away_plan),
+        (&home_plan, &MatchPlan::default()),
+    ] {
+        let missing_plan =
+            serde_json::to_value(matches::play(team("a", home), team("b", away), 1001).unwrap())
+                .unwrap();
+        assert_ne!(expected, missing_plan);
+    }
+    let results = game.advance_closed_day(1, 1000, 2000).unwrap();
+    assert_eq!(serde_json::to_value(&results[0].report).unwrap(), expected);
+    assert_eq!(game.match_plan("a").unwrap(), home_plan);
+    assert_eq!(game.match_plan("b").unwrap(), away_plan);
+}
+
+#[test]
+fn changing_match_plans_does_not_invalidate_transfer_preview() {
+    let mut game = setup();
+    let Outcome::Offered(offer) = game
+        .dispatch(
+            "a",
+            request(
+                "bid",
+                1,
+                Command::Offer {
+                    player_id: "b-10".into(),
+                    fee: 100,
+                },
+            ),
+            20,
+        )
+        .unwrap()
+        .result
+        .unwrap()
+    else {
+        panic!("expected offer")
+    };
+    let Outcome::Preview(preview) = game
+        .dispatch(
+            "b",
+            request("review", 1, Command::Review { offer_id: offer.id }),
+            30,
+        )
+        .unwrap()
+        .result
+        .unwrap()
+    else {
+        panic!("expected preview")
+    };
+    for actor in ["a", "b"] {
+        game.dispatch(
+            actor,
+            request(
+                "plan",
+                1,
+                Command::SetMatchPlan {
+                    plan: management::tactics::MatchPlan {
+                        play_style: engine::PlayStyle::Defensive,
+                        ..Default::default()
+                    },
+                },
+            ),
+            40,
+        )
+        .unwrap()
+        .result
+        .unwrap();
+    }
+    assert_eq!(
+        game.dispatch(
+            "b",
+            request(
+                "confirm",
+                1,
+                Command::Confirm {
+                    preview_id: preview.id
+                }
+            ),
+            50
+        )
+        .unwrap()
+        .result,
+        Ok(Outcome::Transferred { offer_id: offer.id })
+    );
+}

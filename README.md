@@ -36,6 +36,13 @@ facility factors. Other training focuses, injury persistence and emergency roste
 rules must be completed before autonomous careers. The fixtures example supplies
 synthetic recovery profiles and verifies an off-day after its two matches.
 
+Managers can also set a private, persistent pre-match plan: six play styles and
+the nine engine phase-tactic settings. Both clubs' plans feed delegated matches;
+automatic in-match adjustments do not overwrite the saved plan. The example
+uses Possession versus Counter. Formation remains 4-4-2; formation-slot mapping,
+player-role commands and set pieces are not yet implemented. See
+[the tactical slice](plans/0006-persistent-match-tactics.md).
+
 ## License and attribution
 
 The repository contains the GNU GPL version 3 in [LICENSE](LICENSE). Imported
